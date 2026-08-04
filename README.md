@@ -720,6 +720,13 @@ No env vars set? DDG is the default. Add any key above to instantly upgrade sear
 
 ## Roadmap
 
+### Living research fork
+
+This project now includes the first foundation for continuous investigations: persistent
+research projects, tiered question trees, graph-ready finding maps, explainable discovery
+frontiers, and suggested follow-up threads. See
+[`docs/LIVING_RESEARCH.md`](docs/LIVING_RESEARCH.md) for the architecture and API.
+
 - [x] V4 pipeline (BYOK — bring your own LLM key, any provider)
 - [x] Quality scoring (avg 0.77, top missions reach 0.82+)
 - [x] REST API (14 endpoints)
