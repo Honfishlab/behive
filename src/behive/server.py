@@ -24,6 +24,9 @@ def _get_semaphore() -> asyncio.Semaphore:
     return _mission_semaphore
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from pathlib import Path
 from pydantic import BaseModel, Field
 
 # Install legacy import shims
@@ -33,7 +36,6 @@ try:
     install_ops_shim()
 except ImportError:
     pass
-
 
 # ─── DB connection ────────────────────────────────────────────────────────────
 
@@ -158,6 +160,14 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+_web_dir = Path(__file__).parent / "web"
+if _web_dir.exists():
+    app.mount("/app/assets", StaticFiles(directory=_web_dir), name="research-app-assets")
+
+    @app.get("/app", include_in_schema=False)
+    async def research_workspace():
+        return FileResponse(_web_dir / "index.html")
 
 # ─── Free Tools Routers ──────────────────────────────────────────────────────
 try:
@@ -440,16 +450,7 @@ async def get_research(mission_id: str):
         topic, status, phase, report = row
         cur.execute("""
             SELECT claim, confidence, quality_score, source_url, claim_type
-            FROM hive_claims
-            WHERE mission_id = %s AND (is_garbage = false OR is_garbage IS NULL)
-            ORDER BY quality_score DESC LIMIT 500
-        """, (mission_id,))
-        claims = [
-            {"text": r[0], "confidence": r[1], "quality_score": r[2], "source_url": r[3], "type": r[4]}
-            for r in cur.fetchall()
-        ]
-        conn.close()
-        avg_q = sum(c["quali…587 tokens truncated…et_db()
+        …693 tokens truncated…et_db()
         cur = conn.cursor()
         cur.execute("""
             SELECT claim, quality_score, source_url, mission_id, claim_type, confidence
