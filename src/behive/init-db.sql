@@ -337,6 +337,7 @@ CREATE TABLE IF NOT EXISTS hive_projects (
     root_question TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'active',
     cadence_minutes INTEGER NOT NULL DEFAULT 1440,
+    agent_policy JSONB NOT NULL DEFAULT '{"autonomy":"assisted","status":"paused","daily_budget":10,"max_agents":3,"max_depth":5,"min_confidence":0.7,"primary_sources_required":true,"approval_new_branches":true,"freshness_days":30}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -361,6 +362,7 @@ CREATE TABLE IF NOT EXISTS hive_findings (
     project_id TEXT NOT NULL REFERENCES hive_projects(id) ON DELETE CASCADE,
     question_id TEXT NOT NULL REFERENCES hive_questions(id) ON DELETE CASCADE,
     claim_id INTEGER REFERENCES hive_claims(id),
+    source_url TEXT,
     summary TEXT NOT NULL,
     confidence REAL NOT NULL DEFAULT 0.0,
     novelty REAL NOT NULL DEFAULT 0.0,
