@@ -329,3 +329,46 @@ CREATE TABLE IF NOT EXISTS hive_queen_assessments (
     created_at              TIMESTAMPTZ DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_queen_assessments_mission ON hive_queen_assessments(mission_id);
+
+-- Living research projects: persistent questions, findings, and discovery cycles.
+CREATE TABLE IF NOT EXISTS hive_projects (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    root_question TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    cadence_minutes INTEGER NOT NULL DEFAULT 1440,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS hive_questions (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES hive_projects(id) ON DELETE CASCADE,
+    parent_id TEXT REFERENCES hive_questions(id) ON DELETE CASCADE,
+    mission_id TEXT REFERENCES hive_missions(id),
+    question TEXT NOT NULL,
+    depth INTEGER NOT NULL DEFAULT 0,
+    kind TEXT NOT NULL DEFAULT 'followup',
+    priority REAL NOT NULL DEFAULT 0.5,
+    confidence REAL NOT NULL DEFAULT 0.0,
+    status TEXT NOT NULL DEFAULT 'open',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS hive_findings (
+    id BIGSERIAL PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES hive_projects(id) ON DELETE CASCADE,
+    question_id TEXT NOT NULL REFERENCES hive_questions(id) ON DELETE CASCADE,
+    claim_id INTEGER REFERENCES hive_claims(id),
+    summary TEXT NOT NULL,
+    confidence REAL NOT NULL DEFAULT 0.0,
+    novelty REAL NOT NULL DEFAULT 0.0,
+    status TEXT NOT NULL DEFAULT 'supported',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_questions_project_frontier
+    ON hive_questions(project_id, status, priority DESC);
+CREATE INDEX IF NOT EXISTS idx_findings_project_question
+    ON hive_findings(project_id, question_id, created_at DESC);
