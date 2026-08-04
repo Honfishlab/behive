@@ -37,6 +37,27 @@ class QuestionCreate(BaseModel):
     priority: float = Field(default=0.5, ge=0, le=1)
 
 
+class AgentPolicy(BaseModel):
+    autonomy: str = Field(default="assisted", pattern="^(manual|assisted|guarded|continuous)$")
+    status: str = Field(default="paused", pattern="^(paused|running)$")
+    daily_budget: float = Field(default=10, ge=0, le=10000)
+    max_agents: int = Field(default=3, ge=1, le=50)
+    max_depth: int = Field(default=5, ge=1, le=20)
+    min_confidence: float = Field(default=0.7, ge=0, le=1)
+    primary_sources_required: bool = True
+    approval_new_branches: bool = True
+    freshness_days: int = Field(default=30, ge=1, le=3650)
+
+
+class FindingCreate(BaseModel):
+    question_id: str
+    summary: str = Field(min_length=10, max_length=4000)
+    source_url: str | None = None
+    confidence: float = Field(default=0.5, ge=0, le=1)
+    novelty: float = Field(default=0.5, ge=0, le=1)
+    status: str = Field(default="unreviewed", pattern="^(unreviewed|supported|contradicted|superseded)$")
+
+
 @router.post("")
 def create_project(payload: ProjectCreate):
     project_id, root_id = _id("project", payload.title), _id("question", payload.root_question)
@@ -51,6 +72,66 @@ def create_project(payload: ProjectCreate):
             (root_id, project_id, payload.root_question),
         )
     return {"id": project_id, "root_question_id": root_id, "status": "active"}
+
+
+@router.get("")
+def list_projects():
+    with _db() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT p.id,p.title,p.root_question,p.status,p.updated_at,COUNT(DISTINCT q.id),COUNT(DISTINCT f.id) "
+            "FROM hive_projects p LEFT JOIN hive_questions q ON q.project_id=p.id "
+            "LEFT JOIN hive_findings f ON f.project_id=p.id GROUP BY p.id ORDER BY p.updated_at DESC"
+        )
+        rows = cur.fetchall()
+    return {"projects": [{"id": r[0], "title": r[1], "root_question": r[2], "status": r[3],
+                           "updated_at": r[4], "questions": r[5], "findings": r[6]} for r in rows]}
+
+
+@router.put("/{project_id}/policy")
+def update_policy(project_id: str, payload: AgentPolicy):
+    policy = payload.model_dump()
+    with _db() as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE hive_projects SET agent_policy=%s::jsonb,updated_at=NOW() WHERE id=%s RETURNING id",
+            (json.dumps(policy), project_id),
+        )
+        if not cur.fetchone():
+            raise HTTPException(404, "Research project not found")
+    return {"project_id": project_id, "policy": policy}
+
+
+@router.post("/{project_id}/findings")
+def add_finding(project_id: str, payload: FindingCreate):
+    with _db() as conn, conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM hive_questions WHERE id=%s AND project_id=%s", (payload.question_id, project_id))
+        if not cur.fetchone():
+            raise HTTPException(400, "Question is not in this project")
+        cur.execute(
+            "INSERT INTO hive_findings (project_id,question_id,summary,source_url,confidence,novelty,status) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+            (project_id, payload.question_id, payload.summary, payload.source_url,
+             payload.confidence, payload.novelty, payload.status),
+        )
+        finding_id = cur.fetchone()[0]
+    return {"id": finding_id, "status": payload.status}
+
+
+@router.get("/{project_id}/workspace")
+def project_workspace(project_id: str):
+    graph = project_map(project_id)
+    with _db() as conn, conn.cursor() as cur:
+        cur.execute("SELECT agent_policy,cadence_minutes,updated_at FROM hive_projects WHERE id=%s", (project_id,))
+        policy = cur.fetchone()
+        cur.execute(
+            "SELECT DISTINCT COALESCE(f.source_url,c.source_url),c.claim,f.confidence,f.created_at "
+            "FROM hive_findings f LEFT JOIN hive_claims c ON c.id=f.claim_id "
+            "WHERE f.project_id=%s AND COALESCE(f.source_url,c.source_url) IS NOT NULL ORDER BY f.created_at DESC",
+            (project_id,),
+        )
+        sources = cur.fetchall()
+    return {**graph, "policy": policy[0] or {}, "cadence_minutes": policy[1], "updated_at": policy[2],
+            "library": [{"url": r[0], "claim": r[1], "confidence": r[2], "added_at": r[3]} for r in sources],
+            "approvals": [n for n in graph["nodes"] if n.get("type") == "finding" and n.get("status") == "unreviewed"]}
 
 
 @router.post("/{project_id}/questions")
