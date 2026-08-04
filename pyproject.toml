@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 where = ["src"]
 
 [tool.setuptools.package-data]
-behive = ["init-db.sql", "engine/hive_api_sources.json", "../llms.txt"]
+behive = ["init-db.sql", "engine/hive_api_sources.json", "web/*", "../llms.txt"]
 
 [project]
 name = "behive"
@@ -95,5 +95,4 @@ asyncio_mode = "auto"
 [tool.ruff]
 line-length = 100
 target-version = "py311"
-
 
