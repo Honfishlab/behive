@@ -1,4 +1,4 @@
-"""BeHive API Server — FastAPI app for research missions."""
+"""BeHive API Server - FastAPI app for research missions."""
 
 import os
 import re
@@ -13,7 +13,7 @@ from typing import Optional, AsyncGenerator
 from fastapi import FastAPI, HTTPException, Request, Depends, Query
 from behive import __version__ as BEHIVE_VERSION
 
-# ─── Concurrency control ──────────────────────────────────────────────────────
+#     Concurrency control                                                       
 _MAX_CONCURRENT_MISSIONS = int(os.environ.get("BEHIVE_MAX_CONCURRENT", "3"))
 _mission_semaphore: asyncio.Semaphore = None  # initialized in lifespan
 
@@ -37,7 +37,7 @@ try:
 except ImportError:
     pass
 
-# ─── DB connection ────────────────────────────────────────────────────────────
+#     DB connection                                                             
 
 def get_db_url():
     if os.environ.get("DATABASE_URL"):
@@ -54,7 +54,7 @@ def get_db_url():
 
 
 def get_db_url_display():
-    """Return DB URL with password masked — for logs and health endpoint."""
+    """Return DB URL with password masked - for logs and health endpoint."""
     url = get_db_url()
     return re.sub(r"://([^:]+):([^@]+)@", r"://\1:***@", url)
 
@@ -84,7 +84,7 @@ def get_db():
         raise RuntimeError(f"Database error: {e}") from e
 
 
-# ─── Auth ─────────────────────────────────────────────────────────────────────
+#     Auth                                                                      
 
 def verify_auth(request: Request):
     """Check API key if BEHIVE_API_KEY is set."""
@@ -100,7 +100,7 @@ def verify_auth(request: Request):
     raise HTTPException(401, "Invalid or missing API key")
 
 
-# ─── Rate Limiting ────────────────────────────────────────────────────────────
+#     Rate Limiting                                                             
 
 class TokenBucket:
     def __init__(self, rate: int, per: int = 60):
@@ -123,27 +123,27 @@ _rate_limiter = TokenBucket(rate=60, per=60)
 _research_limiter = TokenBucket(rate=5, per=60)
 
 
-# ─── App ──────────────────────────────────────────────────────────────────────
+#     App                                                                       
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Application lifespan — check DB connectivity on startup."""
-    print("🐝 BeHive API starting...")
-    # Validate DB connection at startup (non-fatal — API still serves /health as degraded)
+    """Application lifespan - check DB connectivity on startup."""
+    print("   BeHive API starting...")
+    # Validate DB connection at startup (non-fatal - API still serves /health as degraded)
     try:
         conn = get_db()
         cur = conn.cursor()
         cur.execute("SELECT 1")
         conn.close()
-        print("✅ PostgreSQL connected")
+        print("  PostgreSQL connected")
     except RuntimeError as e:
-        print(f"⚠️  Database not available: {e}")
+        print(f"    Database not available: {e}")
         print("   The API will start but /research will fail until DB is configured.")
         print("   Run: behive init-db")
     except Exception as e:
-        print(f"⚠️  Database check failed: {e}")
+        print(f"    Database check failed: {e}")
     yield
-    print("🐝 BeHive API shutdown.")
+    print("   BeHive API shutdown.")
 
 
 app = FastAPI(
@@ -169,14 +169,14 @@ if _web_dir.exists():
     async def research_workspace():
         return FileResponse(_web_dir / "index.html")
 
-# ─── Free Tools Routers ──────────────────────────────────────────────────────
+#     Free Tools Routers                                                       
 try:
     from behive.brand_check import router as brand_check_router
     app.include_router(brand_check_router)
 except ImportError:
     pass
 
-# ─── Federated Knowledge Network ─────────────────────────────────────────────
+#     Federated Knowledge Network                                              
 try:
     from behive.federation import router as federation_router
     app.include_router(federation_router)
@@ -191,7 +191,7 @@ except ImportError:
     pass
 
 
-# ─── SSE Event Bus ────────────────────────────────────────────────────────────
+#     SSE Event Bus                                                             
 
 _mission_events: dict[str, list[dict]] = defaultdict(list)
 _mission_subscribers: dict[str, list[asyncio.Queue]] = defaultdict(list)
@@ -211,7 +211,7 @@ def _emit_event(mission_id: str, event: str, data: dict):
             pass
 
 
-# ─── Security Middleware ──────────────────────────────────────────────────────
+#     Security Middleware                                                       
 
 @app.middleware("http")
 async def security_middleware(request: Request, call_next):
@@ -230,7 +230,7 @@ async def security_middleware(request: Request, call_next):
     return response
 
 
-# ─── Models ───────────────────────────────────────────────────────────────────
+#     Models                                                                    
 
 class ResearchRequest(BaseModel):
     query: str = Field(default="", description="Research topic or question")
@@ -253,7 +253,7 @@ class HealthResponse(BaseModel):
     db: str = ""
 
 
-# ─── Entity Extraction (lightweight NLP) ─────────────────────────────────────
+#     Entity Extraction (lightweight NLP)                                      
 
 _ENTITY_PATTERN = re.compile(
     r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*(?:\s+(?:Inc|Corp|Ltd|LLC|AG|SA|GmbH|Co|plc)\.?)?)\b'
@@ -303,11 +303,11 @@ def _get_typed_entities_for_claim(cur, claim_text: str, mission_id: str) -> list
     return [{"type": r[0], "name": r[1]} for r in cur.fetchall()]
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+#                                                                                
 # ENDPOINTS
-# ═══════════════════════════════════════════════════════════════════════════════
+#                                                                                
 
-# ─── 1. Health ────────────────────────────────────────────────────────────────
+#     1. Health                                                                 
 
 @app.get("/health", response_model=HealthResponse)
 async def health():
@@ -330,7 +330,7 @@ async def health():
         return HealthResponse(status="degraded", db=str(e)[:200])
 
 
-# ─── 2. Start Research ────────────────────────────────────────────────────────
+#     2. Start Research                                                         
 
 @app.post("/research", dependencies=[Depends(verify_auth)])
 async def start_research(req: ResearchRequest):
@@ -365,7 +365,7 @@ async def start_research(req: ResearchRequest):
     }
 
 
-# ─── 3. Research Status ──────────────────────────────────────────────────────
+#     3. Research Status                                                       
 
 @app.get("/research/{mission_id}/status")
 async def research_status(mission_id: str):
@@ -400,7 +400,7 @@ async def research_status(mission_id: str):
         raise HTTPException(500, str(e))
 
 
-# ─── 4. SSE Events Stream ────────────────────────────────────────────────────
+#     4. SSE Events Stream                                                     
 
 @app.get("/research/{mission_id}/events")
 async def research_events(mission_id: str):
@@ -434,7 +434,7 @@ async def research_events(mission_id: str):
     )
 
 
-# ─── 5. Get Full Research Results ─────────────────────────────────────────────
+#     5. Get Full Research Results                                              
 
 @app.get("/research/{mission_id}")
 async def get_research(mission_id: str):
@@ -450,7 +450,7 @@ async def get_research(mission_id: str):
         topic, status, phase, report = row
         cur.execute("""
             SELECT claim, confidence, quality_score, source_url, claim_type
-        …693 tokens truncated…et_db()
+         693 tokens truncated et_db()
         cur = conn.cursor()
         cur.execute("""
             SELECT claim, quality_score, source_url, mission_id, claim_type, confidence
@@ -469,7 +469,7 @@ async def get_research(mission_id: str):
         raise HTTPException(500, str(e))
 
 
-# ─── 8. Search alias ─────────────────────────────────────────────────────────
+#     8. Search alias                                                          
 
 @app.get("/search")
 async def search_alias(query: str = Query(..., alias="query"), limit: int = Query(20, ge=1, le=100)):
@@ -477,7 +477,7 @@ async def search_alias(query: str = Query(..., alias="query"), limit: int = Quer
     return await search_claims(q=query, limit=limit)
 
 
-# ─── 9. List Missions ────────────────────────────────────────────────────────
+#     9. List Missions                                                         
 
 @app.get("/missions")
 async def list_missions(limit: int = Query(20, ge=1, le=100), offset: int = Query(0, ge=0)):
@@ -514,11 +514,11 @@ async def list_missions(limit: int = Query(20, ge=1, le=100), offset: int = Quer
         raise HTTPException(500, str(e))
 
 
-# ─── 10. Intelligence: Entity ────────────────────────────────────────────────
+#     10. Intelligence: Entity                                                 
 
 @app.get("/intelligence/entity/{name}")
 async def intelligence_entity(name: str, limit: int = Query(50, ge=1, le=200)):
-    """Get intelligence about a specific entity — from knowledge graph or claims.
+    """Get intelligence about a specific entity - from knowledge graph or claims.
     
     Uses LLM-extracted typed entities from hive_entities (72K+ entries),
     with Neo4j graph as enrichment layer.
@@ -606,11 +606,11 @@ async def intelligence_entity(name: str, limit: int = Query(50, ge=1, le=200)):
         raise HTTPException(500, str(e))
 
 
-# ─── 11. Intelligence: Network ───────────────────────────────────────────────
+#     11. Intelligence: Network                                                
 
 @app.get("/intelligence/network/{name}")
 async def intelligence_network(name: str, depth: int = Query(2, ge=1, le=3)):
-    """Entity relationship network — from knowledge graph or hive_entities co-occurrence.
+    """Entity relationship network - from knowledge graph or hive_entities co-occurrence.
     
     Uses LLM-extracted typed entities (72K+ records) to build relationship networks.
     Edges represent co-occurrence within the same mission (semantically related).
@@ -708,7 +708,7 @@ async def intelligence_network(name: str, depth: int = Query(2, ge=1, le=3)):
         raise HTTPException(500, str(e))
 
 
-# ─── 12. Intelligence: Stats ─────────────────────────────────────────────────
+#     12. Intelligence: Stats                                                  
 
 @app.get("/intelligence/stats")
 async def intelligence_stats():
@@ -790,15 +790,15 @@ async def intelligence_stats():
         raise HTTPException(500, str(e))
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+#                                                                                
 # PIPELINE RUNNER
-# ═══════════════════════════════════════════════════════════════════════════════
+#                                                                                
 
 async def _run_pipeline(mission_id: str, topic: str, depth: int):
     """Run research pipeline as subprocess, stream progress via SSE events."""
     import sys
     
-    # Concurrency limiter — max N missions at once
+    # Concurrency limiter - max N missions at once
     sem = _get_semaphore()
     if sem.locked():
         _emit_event(mission_id, "queued", {"position": _MAX_CONCURRENT_MISSIONS, "message": "Waiting for slot..."})
