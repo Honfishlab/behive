@@ -450,7 +450,73 @@ async def get_research(mission_id: str):
         topic, status, phase, report = row
         cur.execute("""
             SELECT claim, confidence, quality_score, source_url, claim_type
-         693 tokens truncated et_db()
+            FROM hive_claims
+            WHERE mission_id = %s AND (is_garbage = false OR is_garbage IS NULL)
+            ORDER BY quality_score DESC LIMIT 500
+        """, (mission_id,))
+        claims = [
+            {"text": r[0], "confidence": r[1], "quality_score": r[2], "source_url": r[3], "type": r[4]}
+            for r in cur.fetchall()
+        ]
+        conn.close()
+        avg_q = sum(c["quality_score"] or 0 for c in claims) / max(1, len(claims))
+        return {
+            "mission_id": mission_id,
+            "topic": topic,
+            "status": status,
+            "phase": phase,
+            "report": report or "",
+            "claims": claims,
+            "metrics": {"total_claims": len(claims), "avg_quality": round(avg_q, 4)},
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+#     6. Get Report Only                                                       
+
+@app.get("/research/{mission_id}/report")
+async def get_report(mission_id: str):
+    """Get synthesized report for a completed mission (no claims array)."""
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT topic, status, synthesis FROM hive_missions WHERE id = %s", (mission_id,))
+        row = cur.fetchone()
+        if not row:
+            conn.close()
+            raise HTTPException(404, f"Mission {mission_id} not found")
+        topic, status, synthesis = row
+        cur.execute(
+            "SELECT COUNT(*), COALESCE(AVG(quality_score), 0) FROM hive_claims WHERE mission_id = %s AND (is_garbage = false OR is_garbage IS NULL)",
+            (mission_id,)
+        )
+        crow = cur.fetchone()
+        conn.close()
+        if status != "done":
+            raise HTTPException(202, f"Mission still in progress (status={status})")
+        return {
+            "mission_id": mission_id,
+            "topic": topic,
+            "synthesis": synthesis or "",
+            "claims_count": crow[0] or 0,
+            "avg_quality": round(float(crow[1] or 0), 4),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+#     7. Search Claims (primary path)                                          
+
+@app.get("/claims/search")
+async def search_claims(q: str, limit: int = Query(20, ge=1, le=100)):
+    """Full-text search across all mission claims."""
+    try:
+        conn = get_db()
         cur = conn.cursor()
         cur.execute("""
             SELECT claim, quality_score, source_url, mission_id, claim_type, confidence
