@@ -11,8 +11,11 @@ const $=selector=>document.querySelector(selector);
 function escapeHtml(value){const div=document.createElement('div');div.textContent=value??'';return div.innerHTML}
 async function api(path,options={}){const response=await fetch(path,{headers:{'Content-Type':'application/json',...(options.headers||{})},...options});const data=await response.json().catch(()=>({}));if(!response.ok)throw new Error(data.detail||data.message||`Request failed (${response.status})`);return data}
 async function ensureProject(){
+ if(projectId){
+  try{await loadTree();return}
+  catch(error){localStorage.removeItem('behiveProjectId');projectId=null;rootNode=null;selectedQuestion=null}
+ }
  try{
-  if(projectId){await loadTree();return}
   const created=await api('/projects',{method:'POST',body:JSON.stringify({title:$('#projectTitle').textContent.trim(),root_question:$('#rootQuestion').textContent.trim(),cadence_minutes:1440})});
   projectId=created.id;localStorage.setItem('behiveProjectId',projectId);await loadTree();
  }catch(error){$('#missionMessage').textContent=`Project storage unavailable: ${error.message}`}
@@ -32,13 +35,13 @@ function render(){
  $('#editQuestion').disabled=!selectedQuestion;drawGraph();
 }
 function selectQuestion(id){selectedQuestion=questions.find(q=>q.id===id)||null;$('#rootTreeCard').classList.remove('selected');render();$('#addQuestion').textContent=selectedQuestion?'＋ Add child':'＋ Add question'}
-function selectRoot(){if(!rootNode)return;selectedQuestion={id:rootNode.id,title:rootNode.label,depth:0,confidence:Math.round((rootNode.confidence||0)*100),findings:0,kind:'ROOT',priority:rootNode.priority||1,status:rootNode.status||'open',isRoot:true};$('#rootTreeCard').classList.add('selected');render();$('#rootTreeCard').classList.add('selected');$('#addQuestion').textContent='＋ Add child'}
+async function selectRoot(){if(!rootNode)await ensureProject();if(!rootNode){$('#missionMessage').textContent='The root question could not be loaded. Check database health and refresh.';return}selectedQuestion={id:rootNode.id,title:rootNode.label,depth:0,confidence:Math.round((rootNode.confidence||0)*100),findings:0,kind:'ROOT',priority:rootNode.priority||1,status:rootNode.status||'open',isRoot:true};$('#rootTreeCard').classList.add('selected');render();$('#rootTreeCard').classList.add('selected');$('#addQuestion').textContent='＋ Add child'}
 function drawGraph(){const svg=$('#graphSvg');const shown=questions.slice(0,4);let nodes=[{x:450,y:70,t:'Root question',c:'#215b43'}];shown.forEach((q,i)=>nodes.push({x:150+i*200,y:230,t:q.kind,c:'#6989bd'}));findings.slice(0,shown.length).forEach((f,i)=>nodes.push({x:150+i*200,y:410,t:f.score+'% finding',c:'#d99b35'}));let lines=shown.map((_,i)=>`<line x1="450" y1="70" x2="${150+i*200}" y2="230"/>`).join('')+findings.slice(0,shown.length).map((_,i)=>`<line x1="${150+i*200}" y1="230" x2="${150+i*200}" y2="410"/>`).join('');svg.innerHTML=`<g stroke="#c7d0c8" stroke-width="2">${lines}</g>`+nodes.map(n=>`<g><circle cx="${n.x}" cy="${n.y}" r="18" fill="${n.c}"/><text x="${n.x}" y="${n.y+34}" text-anchor="middle" font-size="11" fill="#34443b">${escapeHtml(n.t)}</text></g>`).join('')}
 const dlg=$('#questionDialog');
 function openAdd(){dialogMode='add';$('#questionDialogTitle').textContent=selectedQuestion?'Add child question':'Add research question';$('#questionText').value='';$('#questionPriority').value='0.5';$('#questionStatus').value='open';$('#questionParent').textContent=selectedQuestion?`Parent: ${selectedQuestion.title}`:'New top-level branch';$('#archiveQuestion').hidden=true;dlg.showModal()}
 function openEdit(){if(!selectedQuestion)return;dialogMode='edit';$('#questionDialogTitle').textContent=selectedQuestion.isRoot?'Edit root research question':'Edit research question';$('#questionText').value=selectedQuestion.title;$('#questionPriority').value=selectedQuestion.priority;$('#questionStatus').value=selectedQuestion.status;$('#questionParent').textContent=selectedQuestion.isRoot?'Root of this investigation':`Depth ${selectedQuestion.depth}`;$('#archiveQuestion').hidden=Boolean(selectedQuestion.isRoot);dlg.showModal()}
 $('#addQuestion').onclick=openAdd;$('#editQuestion').onclick=openEdit;
-$('#rootTreeCard').onclick=selectRoot;$('#rootTreeCard').ondblclick=()=>{selectRoot();openEdit()};
+$('#rootTreeCard').onclick=()=>selectRoot();$('#rootTreeCard').ondblclick=async()=>{await selectRoot();if(selectedQuestion?.isRoot)openEdit()};
 dlg.addEventListener('close',async()=>{
  if(!['save','archive'].includes(dlg.returnValue))return;
  try{
