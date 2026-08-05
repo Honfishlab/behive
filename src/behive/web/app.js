@@ -17,7 +17,45 @@ function render(){
 }
 function drawGraph(){const svg=document.querySelector('#graphSvg');let nodes=[{x:450,y:70,t:'How will AI infrastructure evolve?',c:'#215b43'}];questions.forEach((q,i)=>nodes.push({x:150+i*200,y:230,t:q.kind,c:'#6989bd'}));findings.slice(0,4).forEach((f,i)=>nodes.push({x:150+i*200,y:410,t:f.score+'% finding',c:'#d99b35'}));let lines=questions.map((_,i)=>`<line x1="450" y1="70" x2="${150+i*200}" y2="230"/>`).join('')+questions.map((_,i)=>`<line x1="${150+i*200}" y1="230" x2="${150+i*200}" y2="410"/>`).join('');svg.innerHTML=`<g stroke="#c7d0c8" stroke-width="2">${lines}</g>`+nodes.map(n=>`<g><circle cx="${n.x}" cy="${n.y}" r="18" fill="${n.c}"/><text x="${n.x}" y="${n.y+34}" text-anchor="middle" font-size="11" fill="#34443b">${n.t}</text></g>`).join('')}
 document.querySelectorAll('[data-panel]').forEach(b=>b.onclick=()=>{document.querySelectorAll('[data-panel]').forEach(x=>x.classList.remove('active'));b.classList.add('active');let graph=b.dataset.panel==='graph';document.querySelector('#workspace').classList.toggle('hidden',graph);document.querySelector('#graphView').classList.toggle('hidden',!graph)});
-const toggle=document.querySelector('#toggleRun');toggle.onclick=()=>{let running=toggle.textContent==='Start research';toggle.textContent=running?'Pause research':'Start research';document.querySelector('#runStatus').textContent=running?'4 agents researching':'Agents paused'};
+const toggle=document.querySelector('#toggleRun');
+const runStatus=document.querySelector('#runStatus');
+const missionMessage=document.querySelector('#missionMessage');
+let activeMission=null;
+let missionTimer=null;
+async function pollMission(){
+ if(!activeMission)return;
+ try{
+  const response=await fetch(`/research/${activeMission}/status`);
+  const data=await response.json();
+  if(!response.ok)throw new Error(data.detail||'Could not read mission status');
+  const count=data.claims_count??data.total_claims??0;
+  runStatus.textContent=`${data.phase||data.status} · ${count} findings`;
+  missionMessage.textContent=`Mission ${activeMission} · ${data.status} · ${data.phase||'starting'}`;
+  if(['done','error','cancelled'].includes(data.status)){
+   clearInterval(missionTimer);missionTimer=null;toggle.disabled=false;toggle.textContent='Start another';
+   if(data.status==='done')await loadMissionResults();
+  }
+ }catch(error){runStatus.textContent='Status unavailable';missionMessage.textContent=error.message}
+}
+async function loadMissionResults(){
+ try{
+  const response=await fetch(`/research/${activeMission}`);if(!response.ok)return;
+  const data=await response.json();const claims=data.claims||[];
+  findings.splice(0,findings.length,...claims.slice(0,20).map(c=>({time:'NEW FINDING',score:Math.round((c.confidence||c.quality_score||0)*100),text:c.text||c.claim,source:c.source_url||'Source pending'})));
+  render();missionMessage.textContent=`Complete · ${claims.length} sourced findings available`;
+ }catch(error){missionMessage.textContent=`Research complete; results could not be loaded: ${error.message}`}
+}
+toggle.onclick=async()=>{
+ const question=document.querySelector('#rootQuestion').textContent.trim();
+ if(question.length<8){missionMessage.textContent='Enter a research question of at least 8 characters.';return}
+ toggle.disabled=true;toggle.textContent='Starting…';runStatus.textContent='Starting research';missionMessage.textContent='Creating a new BeHive mission…';
+ try{
+  const response=await fetch('/research',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query:question,depth:3,scale:30})});
+  const data=await response.json();if(!response.ok)throw new Error(data.detail||data.message||'Research could not start');
+  activeMission=data.job_id||data.mission_id;toggle.textContent='Research running';runStatus.textContent='Agents starting';missionMessage.textContent=`Mission ${activeMission} created`;
+  await pollMission();missionTimer=setInterval(pollMission,3000);
+ }catch(error){toggle.disabled=false;toggle.textContent='Start research';runStatus.textContent='Could not start';missionMessage.textContent=error.message}
+};
 ['budget','maxAgents'].forEach(id=>document.querySelector('#'+id).oninput=e=>document.querySelector('#'+id.replace('maxAgents','agents')+'Out').textContent=e.target.value);
 document.querySelector('#autonomy').onchange=e=>document.querySelector('#autonomyBadge').textContent=e.target.value.toUpperCase();
 const dlg=document.querySelector('#questionDialog');document.querySelector('#addQuestion').onclick=()=>dlg.showModal();dlg.addEventListener('close',()=>{let text=dlg.querySelector('textarea').value.trim();if(dlg.returnValue==='add'&&text){questions.push({title:text,confidence:0,findings:0,kind:'NEW LEAD'});dlg.querySelector('textarea').value='';render()}});
