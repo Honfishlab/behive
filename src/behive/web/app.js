@@ -31,7 +31,7 @@ function render(){
  $('#questionTree').innerHTML=questions.sort((a,b)=>a.depth-b.depth||b.priority-a.priority).map(q=>`<div class="branch" style="margin-left:${Math.max(0,q.depth-1)*24}px"><span class="node"></span><div class="question-card ${selectedQuestion?.id===q.id?'selected':''}" data-id="${q.id}"><span class="tag">${escapeHtml(q.kind)} · ${escapeHtml(q.status)}</span><h3>${escapeHtml(q.title)}</h3><div class="bar"><i style="width:${q.confidence}%"></i></div><small>${q.confidence}% confidence · priority ${Math.round(q.priority*100)}%</small></div></div>`).join('')||'<p class="sub">Select Add question to create the first branch.</p>';
  $('#findingFeed').innerHTML=findings.map(f=>`<article class="finding"><div class="meta"><span>${escapeHtml(f.time)}</span><span class="confidence">${f.score}% confidence</span></div><p>${escapeHtml(f.text)}</p><a href="${f.source?.startsWith('http')?escapeHtml(f.source):'#'}">${escapeHtml(f.source)} →</a></article>`).join('');
  $('#agents').innerHTML=agents.map(a=>`<div class="agent"><span class="avatar">${a[0]}</span><div><b>${a[1]}</b><small>${a[2]}</small></div><span>${a[3]}</span></div>`).join('');
- document.querySelectorAll('.question-card').forEach(card=>{card.onclick=()=>selectQuestion(card.dataset.id);card.ondblclick=()=>openEdit()});
+ document.querySelectorAll('#questionTree .question-card').forEach(card=>{card.onclick=()=>selectQuestion(card.dataset.id);card.ondblclick=()=>openEdit()});
  $('#editQuestion').disabled=!selectedQuestion;drawGraph();
 }
 function selectQuestion(id){selectedQuestion=questions.find(q=>q.id===id)||null;$('#rootTreeCard').classList.remove('selected');render();$('#addQuestion').textContent=selectedQuestion?'＋ Add child':'＋ Add question'}
