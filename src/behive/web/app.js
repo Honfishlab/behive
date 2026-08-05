@@ -42,6 +42,10 @@ function openAdd(){dialogMode='add';$('#questionDialogTitle').textContent=select
 function openEdit(){if(!selectedQuestion)return;dialogMode='edit';$('#questionDialogTitle').textContent=selectedQuestion.isRoot?'Edit root research question':'Edit research question';$('#questionText').value=selectedQuestion.title;$('#questionPriority').value=selectedQuestion.priority;$('#questionStatus').value=selectedQuestion.status;$('#questionParent').textContent=selectedQuestion.isRoot?'Root of this investigation':`Depth ${selectedQuestion.depth}`;$('#archiveQuestion').hidden=Boolean(selectedQuestion.isRoot);dlg.showModal()}
 $('#addQuestion').onclick=openAdd;$('#editQuestion').onclick=openEdit;
 $('#rootTreeCard').onclick=()=>selectRoot();$('#rootTreeCard').ondblclick=async()=>{await selectRoot();if(selectedQuestion?.isRoot)openEdit()};
+$('#rootTreeTitle').onclick=event=>event.stopPropagation();
+$('#rootTreeTitle').ondblclick=event=>event.stopPropagation();
+$('#rootTreeTitle').onkeydown=event=>{if(event.key==='Enter'){event.preventDefault();event.currentTarget.blur()}};
+$('#rootTreeTitle').onblur=async event=>{const question=event.currentTarget.textContent.trim();if(question.length<8){$('#missionMessage').textContent='Root question must be at least 8 characters.';if(rootNode)event.currentTarget.textContent=rootNode.label;return}try{if(!rootNode)await ensureProject();await api(`/projects/${projectId}/questions/${rootNode.id}`,{method:'PATCH',body:JSON.stringify({question})});rootNode.label=question;$('#rootQuestion').textContent=question;$('#missionMessage').textContent='Root question saved.'}catch(error){$('#missionMessage').textContent=`Could not save root question: ${error.message}`}};
 dlg.addEventListener('close',async()=>{
  if(!['save','archive'].includes(dlg.returnValue))return;
  try{
