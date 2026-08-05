@@ -37,6 +37,13 @@ class QuestionCreate(BaseModel):
     priority: float = Field(default=0.5, ge=0, le=1)
 
 
+class QuestionUpdate(BaseModel):
+    question: str | None = Field(default=None, min_length=8, max_length=2000)
+    parent_id: str | None = None
+    priority: float | None = Field(default=None, ge=0, le=1)
+    status: str | None = Field(default=None, pattern="^(open|researching|answered|paused|archived)$")
+
+
 class AgentPolicy(BaseModel):
     autonomy: str = Field(default="assisted", pattern="^(manual|assisted|guarded|continuous)$")
     status: str = Field(default="paused", pattern="^(paused|running)$")
@@ -156,6 +163,46 @@ def add_question(project_id: str, payload: QuestionCreate):
             (question_id, project_id, payload.parent_id, payload.question, depth, payload.kind, payload.priority),
         )
     return {"id": question_id, "depth": depth, "status": "open"}
+
+
+@router.patch("/{project_id}/questions/{question_id}")
+def update_question(project_id: str, question_id: str, payload: QuestionUpdate):
+    changes = payload.model_dump(exclude_unset=True)
+    with _db() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT parent_id,depth FROM hive_questions WHERE id=%s AND project_id=%s",
+            (question_id, project_id),
+        )
+        current = cur.fetchone()
+        if not current:
+            raise HTTPException(404, "Question not found")
+        depth = current[1]
+        if "parent_id" in changes:
+            if changes["parent_id"] == question_id:
+                raise HTTPException(400, "A question cannot be its own parent")
+            if changes["parent_id"]:
+                cur.execute(
+                    "SELECT depth FROM hive_questions WHERE id=%s AND project_id=%s",
+                    (changes["parent_id"], project_id),
+                )
+                parent = cur.fetchone()
+                if not parent:
+                    raise HTTPException(400, "Parent question is not in this project")
+                depth = parent[0] + 1
+            else:
+                depth = 0
+        cur.execute(
+            "UPDATE hive_questions SET question=COALESCE(%s,question),parent_id=%s,priority=COALESCE(%s,priority),"
+            "status=COALESCE(%s,status),depth=%s,updated_at=NOW() WHERE id=%s AND project_id=%s RETURNING id",
+            (changes.get("question"), changes.get("parent_id", current[0]), changes.get("priority"),
+             changes.get("status"), depth, question_id, project_id),
+        )
+        if depth == 0 and changes.get("question"):
+            cur.execute(
+                "UPDATE hive_projects SET root_question=%s,updated_at=NOW() WHERE id=%s",
+                (changes["question"], project_id),
+            )
+    return {"id": question_id, "depth": depth, **changes}
 
 
 @router.get("/{project_id}/map")
