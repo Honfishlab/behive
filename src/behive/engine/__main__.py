@@ -4,6 +4,10 @@ import os
 import argparse
 import logging
 
+from behive.config import load_project_env
+
+load_project_env()
+
 log = logging.getLogger(__name__)
 
 # Install compat shims
@@ -39,6 +43,16 @@ def main() -> None:
     args = parser.parse_args()
 
     topic = ' '.join(args.topic) if args.topic else None
+
+    phase_commands = {"resume", "harvest", "process", "synth", "analyze"}
+    if args.command in phase_commands:
+        mission_id = args.mission_id or topic
+        if not mission_id:
+            parser.error(f"{args.command} requires --mission-id")
+        from behive.engine.orchestrator import cmd_analyze, cmd_harvest, cmd_process, cmd_resume, cmd_synth
+        {"resume": cmd_resume, "harvest": cmd_harvest,
+         "process": cmd_process, "synth": cmd_synth, "analyze": cmd_analyze}[args.command](mission_id)
+        return
 
     if not topic:
         parser.print_help()

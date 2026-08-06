@@ -27,7 +27,7 @@ log = logging.getLogger("hive2_synth")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s — %(message)s")
 
 DB_PATH = ""  # Legacy — PostgreSQL is primary
-VENV_PYTHON = 'python3'
+VENV_PYTHON = sys.executable
 REPORTS_DIR = Path('hive-reports')
 
 

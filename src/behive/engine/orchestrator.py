@@ -14,6 +14,7 @@ import json
 import time
 import hashlib
 import subprocess
+import tempfile
 import traceback
 from collections import Counter
 from datetime import datetime
@@ -35,8 +36,9 @@ def _emit(mission_id: str, phase: str, event_type: str, data=None, **kw):
         log.debug(f"Suppressed: {e}")
 
 DB_PATH  = ''
-PYTHON   = 'python3'
+PYTHON   = sys.executable
 HIVE_DIR = Path(os.environ.get('BEHIVE_HOME', os.path.expanduser('~')))
+TMP_DIR = Path(tempfile.gettempdir())
 
 
 def _resolve_cmd(script: str) -> list[str]:
@@ -1065,6 +1067,203 @@ def _connect_db(read_only: bool = False):
     return _cdb(read_only=read_only)
 
 
+def _recover_snippet_content(mission_id: str, limit: int = 80) -> int:
+    """Create low-confidence processable documents from rich search snippets."""
+    import html as _html
+    import re as _re
+    read_con = _connect_db(read_only=True)
+    rows = read_con.execute(
+        "SELECT s.id,s.url,s.domain,s.title,s.snippet FROM hive_sources s "
+        "LEFT JOIN hive_content c ON c.mission_id=s.mission_id AND c.url=s.url "
+        "WHERE s.mission_id=? AND c.id IS NULL AND s.snippet IS NOT NULL "
+        "ORDER BY s.score_total DESC NULLS LAST LIMIT ?", [mission_id, limit]
+    ).fetchall()
+    read_con.close()
+    recovered = 0
+    write_con = _connect_db()
+    try:
+        for source_id, url, domain, title, snippet in rows:
+            clean = _html.unescape(_re.sub(r'<[^>]+>', ' ', snippet or ''))
+            clean = _re.sub(r'\s+', ' ', clean).strip()
+            text = f"Search result title: {title or ''}. Search result summary: {clean}"
+            words = len(text.split())
+            if words < 12:
+                continue
+            write_con.execute(
+                "INSERT INTO hive_content (mission_id,url,domain,title,raw_text,word_count,language,quality_score,harvest_method,harvested_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,NOW())",
+                [mission_id, url, domain or '', title or '', text, words, 'en', 0.25, 'snippet_fallback']
+            )
+            write_con.execute("UPDATE hive_sources SET status='snippet' WHERE id=?", [source_id])
+            recovered += 1
+        write_con.commit()
+    finally:
+        write_con.close()
+    return recovered
+
+
+def _fallback_extract_claims(mission_id: str, limit: int = 30) -> int:
+    """Extract conservative, source-linked claims when optional worker modules yield none."""
+    if _llm_complete is None:
+        return 0
+    con = _connect_db(read_only=True)
+    try:
+        topic_row = con.execute("SELECT topic FROM hive_missions WHERE id=?", [mission_id]).fetchone()
+        docs = con.execute(
+            "SELECT c.url,c.title,c.raw_text,c.harvest_method,COALESCE(s.evidence_tier,9),"
+            "COALESCE(s.verification_status,''),COALESCE(s.is_primary,FALSE) "
+            "FROM hive_content c LEFT JOIN hive_sources s ON s.mission_id=c.mission_id AND s.url=c.url "
+            "WHERE c.mission_id=? AND c.word_count>0 AND COALESCE(c.harvest_method,'')<>'snippet_fallback' "
+            "ORDER BY COALESCE(s.evidence_tier,9),c.quality_score DESC,c.word_count DESC LIMIT ?",
+            [mission_id, limit]
+        ).fetchall()
+    finally:
+        con.close()
+    if not topic_row or not docs:
+        return 0
+
+    topic = topic_row[0]
+    saved = 0
+    write_con = _connect_db()
+    try:
+        for offset in range(0, len(docs), 10):
+            batch = docs[offset:offset + 10]
+            evidence = "\n\n".join(
+                f"SOURCE {i+1}\nURL: {doc[0]}\nTITLE: {doc[1] or ''}\n"
+                f"PROVENANCE: method={doc[3]}, evidence_tier={doc[4]}, registry={doc[5]}, primary={doc[6]}\n"
+                f"TEXT: {(doc[2] or '')[:5000]}"
+                for i, doc in enumerate(batch)
+            )
+            prompt = f"""Research question: {topic}
+
+Extract only claims directly supported by the supplied source text. Do not add outside facts.
+This is a strict evidence gate. Every material concept in a claim must occur explicitly in the same source.
+Never generalize from a class to a member (for example, psychedelics to psilocybin), from a broad disease
+category to a specific disease (for example, neurodegeneration to ALS), or from a mechanism hypothesis to
+a demonstrated therapeutic effect. A paper merely discussing a topic is not evidence that an effect exists.
+Return one JSON object with a "claims" array containing at most 8 objects. Each object must contain:
+- claim: a concise factual finding relevant to the research question
+- source_index: the SOURCE number that supports it
+- evidence: a short paraphrase of the supporting text
+- direct_support: true only if the source directly supports the complete claim
+- limitation: the study boundary that prevents overgeneralization
+- confidence: 0.35 to 0.70
+Return {{"claims": []}} if nothing is supported.
+
+{evidence}"""
+            raw = _llm_complete(prompt, stage="process", max_tokens=1600, temperature=0.1, json_mode=True)
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    parsed = parsed.get("claims", parsed.get("findings", []))
+            except Exception:
+                match = __import__('re').search(r'\[.*\]', raw or '', __import__('re').S)
+                parsed = json.loads(match.group(0)) if match else []
+            if not isinstance(parsed, list):
+                continue
+            for item in parsed:
+                if not isinstance(item, dict):
+                    continue
+                claim = str(item.get("claim", "")).strip()
+                try:
+                    source_number = int(item.get("source_index", 0))
+                except (TypeError, ValueError):
+                    source_number = 0
+                local_index = source_number - 1
+                if (not claim or local_index < 0 or local_index >= len(batch)
+                        or item.get("direct_support") is not True):
+                    continue
+                url = batch[local_index][0]
+                evidence_text = str(item.get("evidence", "")).strip()[:750]
+                limitation = str(item.get("limitation", "")).strip()[:500]
+                if limitation:
+                    evidence_text = f"{evidence_text} Limitation: {limitation}"[:1000]
+                raw_confidence = item.get("confidence", 0.45)
+                if isinstance(raw_confidence, str) and raw_confidence.lower() in {'low', 'medium', 'high'}:
+                    raw_confidence = {'low': 0.35, 'medium': 0.5, 'high': 0.65}[raw_confidence.lower()]
+                try:
+                    confidence = max(0.35, min(0.7, float(raw_confidence)))
+                except (TypeError, ValueError):
+                    confidence = 0.45
+                source_tier = max(1, min(4, int(batch[local_index][4] or 4)))
+                write_con.execute(
+                    "INSERT INTO hive_claims (mission_id,claim,evidence,source_url,claim_type,confidence,quality_score,source_operation,source_tier,verified,extracted_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,FALSE,NOW())",
+                    [mission_id, claim[:2000], evidence_text, url, 'authority_finding', confidence,
+                     confidence, 'authority_gated_extraction', source_tier]
+                )
+                saved += 1
+        write_con.execute(
+            "UPDATE hive_missions SET sources_processed=?, total_facts=?, process_done_at=NOW() WHERE id=?",
+            [len(docs), saved, mission_id]
+        )
+        write_con.commit()
+    finally:
+        write_con.close()
+    return saved
+
+
+def _record_insufficient_evidence(mission_id: str, document_count: int) -> dict:
+    """Persist a truthful no-evidence result instead of reporting a pipeline crash."""
+    from behive.engine.analyst import ANALYSIS_SCHEMA
+    con = _connect_db(read_only=True)
+    try:
+        topic = con.execute("SELECT topic FROM hive_missions WHERE id=?", [mission_id]).fetchone()[0]
+        methods = con.execute(
+            "SELECT COALESCE(harvest_method,'unknown'),COUNT(*) FROM hive_content WHERE mission_id=? GROUP BY harvest_method",
+            [mission_id],
+        ).fetchall()
+        gaps = con.execute(
+            "SELECT gap_query,priority FROM hive_gaps WHERE mission_id=? AND resolved=FALSE ORDER BY priority DESC LIMIT 10",
+            [mission_id],
+        ).fetchall()
+        cited = con.execute(
+            "SELECT COUNT(DISTINCT url) FROM hive_content WHERE mission_id=? AND COALESCE(harvest_method,'')<>'snippet_fallback' AND word_count>=300",
+            [mission_id],
+        ).fetchone()[0]
+    finally:
+        con.close()
+    method_summary = ", ".join(f"{name}: {count}" for name, count in methods) or "none"
+    analysis = {
+        "depth_status": "insufficient",
+        "executive_assessment": (f"The system found {document_count} candidate records but could not extract any defensible, "
+                                 "source-linked findings for this question. No substantive conclusion should be drawn yet."),
+        "rankings": [], "mechanisms": [], "agreements": [], "contradictions": [], "scenarios": [], "deductions": [],
+        "limitations": [
+            "No claim met the minimum evidence threshold.",
+            f"Available material by retrieval method: {method_summary}.",
+            "Search-result summaries are discovery records, not evidence, and were not converted into medical claims.",
+        ],
+        "research_gaps": [{"question": q, "priority": p, "why": "Required to obtain full-text, primary or peer-reviewed evidence."}
+                          for q, p in gaps],
+        "evidence_metrics": {"claims": 0, "cited_sources": 0, "documents_reviewed": document_count,
+                             "full_text_sources": cited, "generated_at": datetime.utcnow().isoformat()},
+    }
+    report = (f"# Insufficient evidence\n\n**Research question:** {topic}\n\n"
+              f"{analysis['executive_assessment']}\n\n## Why research stopped\n\n" +
+              "\n".join(f"- {item}" for item in analysis["limitations"]) +
+              "\n\n## Recommended next questions\n\n" +
+              ("\n".join(f"- {item['question']}" for item in analysis["research_gaps"]) or "- Acquire relevant primary evidence."))
+    write_con = _connect_db()
+    try:
+        write_con.execute(ANALYSIS_SCHEMA)
+        write_con.execute(
+            "INSERT INTO hive_analysis (mission_id,analysis,depth_status,source_count,cited_source_count,claim_count,updated_at) "
+            "VALUES (?,?,?,?,0,0,NOW()) ON CONFLICT(mission_id) DO UPDATE SET analysis=EXCLUDED.analysis,"
+            "depth_status='insufficient',source_count=EXCLUDED.source_count,cited_source_count=0,claim_count=0,updated_at=NOW()",
+            [mission_id, json.dumps(analysis), 'insufficient', document_count],
+        )
+        write_con.execute(
+            "UPDATE hive_missions SET status='insufficient',phase='insufficient',synthesis=?,process_done_at=NOW(),"
+            "quality_metrics=COALESCE(quality_metrics,'{}'::jsonb)||jsonb_build_object('outcome','insufficient_evidence','documents_reviewed',?) WHERE id=?",
+            [report, document_count, mission_id],
+        )
+        write_con.commit()
+    finally:
+        write_con.close()
+    return analysis
+
+
 def _strip_sql_comments(sql: str) -> str:
     """Strip leading/inline -- comments from a SQL statement block."""
     from behive.engine.db_helpers import _strip_sql_comments as _ssc
@@ -1179,8 +1378,8 @@ def run_phase(script: str, args: list[str], phase_name: str,
                 script_path = str(local_path)  # Fall through — will error naturally
         else:
             script_path = str(local_path)
-    pid_file = f"/tmp/hive_{phase_name.replace('/', '_')}.pid"
-    log_file = f"/tmp/hive_{phase_name.replace('/', '_')}_proc.log"
+    pid_file = str(TMP_DIR / f"hive_{phase_name.replace('/', '_')}.pid")
+    log_file = str(TMP_DIR / f"hive_{phase_name.replace('/', '_')}_proc.log")
     
     # Build command — either direct script or -m module invocation
     if script_path is not None:
@@ -1194,6 +1393,39 @@ def run_phase(script: str, args: list[str], phase_name: str,
     log.debug(f"    PID file: {pid_file} | log: {log_file}")
     log.debug(f"{'='*60}")
     sys.stdout.flush()
+
+    # Windows has no bash/nohup/wait toolchain. Run phases directly while
+    # retaining durable logs, timeouts, and exit-code validation.
+    if os.name == 'nt':
+        phase_env = {**os.environ, 'HIVE_PARENT_PID': str(os.getpid()), 'PYTHONUNBUFFERED': '1'}
+        creation_flags = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+        try:
+            with open(log_file, 'w', encoding='utf-8', errors='replace') as phase_log:
+                proc = subprocess.Popen(cmd, stdout=phase_log, stderr=subprocess.STDOUT,
+                                        env=phase_env, creationflags=creation_flags)
+                Path(pid_file).write_text(str(proc.pid), encoding='ascii')
+                try:
+                    return_code = proc.wait(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                    raise RuntimeError(f"Phase {phase_name} timed out after {timeout}s")
+            try:
+                tail = Path(log_file).read_text(encoding='utf-8', errors='replace').splitlines()[-20:]
+                if tail:
+                    log.info("\n".join(tail))
+            except OSError:
+                pass
+            if return_code != 0:
+                raise RuntimeError(f"Phase {phase_name} failed with exit code {return_code}; see {log_file}")
+            elapsed = time.time() - t0
+            log.info(f"[{phase_name.upper()}] completed in {elapsed:.1f}s")
+            return elapsed
+        except FileNotFoundError as exc:
+            raise RuntimeError(f"Cannot launch phase {phase_name}: {exc}") from exc
 
     # Fazy synth: detached double-fork — hive2.py does not wait, process lives on its own
     # This allows hive2.py to exit and release the DB write lock.
@@ -1382,7 +1614,7 @@ def cmd_run(topic: str, think: bool = False, deep: bool = False, force: bool = F
     if _primer_block:
         planner._primer_context = _primer_block  # injected in _build_prompt / plan()
     plan = planner.plan()
-    plan_file = f'/tmp/hive_plan_{mission_id}.json'
+    plan_file = str(TMP_DIR / f'hive_plan_{mission_id}.json')
     with open(plan_file, 'w') as f:
         json.dump(plan, f, ensure_ascii=False, indent=2)
     phase0_elapsed = time.time() - t0
@@ -1543,7 +1775,7 @@ def _run_pipeline_phases(mission_id: str, topic: str, plan: list, timings: dict,
         ))
         timings['prescout'] = time.time() - t_prescout
         # Zapisz routing_map do pliku tymczasowego — HarvesterBee go odczyta
-        _routing_path = f'/tmp/hive_routing_{mission_id}.json'
+        _routing_path = str(TMP_DIR / f'hive_routing_{mission_id}.json')
         with open(_routing_path, 'w') as _f:
             json.dump(_routing, _f, ensure_ascii=False)
         _approved_cnt = len(_routing)
@@ -1576,6 +1808,12 @@ def _run_pipeline_phases(mission_id: str, topic: str, plan: list, timings: dict,
     except Exception:
         _n_harvested = 0
     _emit(mission_id, 'harvest', 'completed', data={'sources_harvested': _n_harvested})
+    if _n_harvested == 0:
+        _n_harvested = _recover_snippet_content(mission_id)
+        _emit(mission_id, 'harvest', 'snippet_recovery', data={'documents_recovered': _n_harvested})
+        log.warning(f"Harvest fetched no full pages; recovered {_n_harvested} labeled search-snippet documents")
+    if _n_harvested < 5:
+        raise RuntimeError(f"Harvest produced only {_n_harvested} usable documents from {_n_sources} discovered sources")
     log.info(f'  └─ done · {timings["harvest"]:.1f}s ──────────────────────────────┘\n')
 
     # ═══ PHASE 3: PROCESS ════════════════════════════════════════
@@ -1602,6 +1840,16 @@ def _run_pipeline_phases(mission_id: str, topic: str, plan: list, timings: dict,
     except Exception:
         _n_docs = 0
     _emit(mission_id, 'process', 'completed', data={'docs_processed': _n_docs})
+    try:
+        _claim_con = _connect_db(read_only=True)
+        _claims_after_process = _claim_con.execute(
+            "SELECT COUNT(*) FROM hive_claims WHERE mission_id=?", [mission_id]
+        ).fetchone()[0]
+        _claim_con.close()
+    except Exception:
+        _claims_after_process = 0
+    if _claims_after_process == 0:
+        raise RuntimeError(f"Process produced 0 findings from {_n_harvested} harvested documents")
     log.info(f'  └─ done · {timings["process"]:.1f}s ──────────────────────────────┘\n')
 
     # ═══ PHASE 3.5: FALSIFIER (claim dedup + cross-validation) ══
@@ -1668,7 +1916,7 @@ Return JSON array of 5 strings only."""
                     for _fqi, _fqq in enumerate(_fq[:3]):  # max 3 to avoid timeout
                         try:
                             _sp.run(
-                                ['python3', 'hive2_scout.py', mission_id, '--followup', _fqq],
+                                _resolve_cmd('hive2_scout.py') + [mission_id, '--followup', _fqq],
                                 timeout=60, capture_output=True
                             )
                         except Exception as e:
@@ -1828,7 +2076,7 @@ Return JSON array of 5 strings only."""
         import subprocess as _subp
         _subp.Popen(
             _resolve_cmd('hive2_intel_summary.py') + ['update', mission_id],
-            stdout=open('/tmp/hive_intel_summary.log', 'a'),
+            stdout=open(TMP_DIR / 'hive_intel_summary.log', 'a'),
             stderr=subprocess.STDOUT,
             env={**os.environ, 'PATH': f'{os.environ.get("PATH","")}'}
         )
@@ -1841,7 +2089,7 @@ Return JSON array of 5 strings only."""
         import subprocess as _subp2
         _subp2.Popen(
             _resolve_cmd('hive2_graph_engine.py') + ['build'],
-            stdout=open('/tmp/hive_graph_build.log', 'a'),
+            stdout=open(TMP_DIR / 'hive_graph_build.log', 'a'),
             stderr=subprocess.STDOUT,
             env={**os.environ, 'PATH': f'{os.environ.get("PATH","")}'}
         )
@@ -1862,7 +2110,7 @@ Return JSON array of 5 strings only."""
             log.debug(f'  👑  Queen planning gap scout …')
             gap_planner = QueenPlanner(gap_query)
             gap_plan = gap_planner.plan()
-            gap_plan_file = f'/tmp/hive_plan_{gap_mission_id}.json'
+            gap_plan_file = str(TMP_DIR / f'hive_plan_{gap_mission_id}.json')
             with open(gap_plan_file, 'w') as gf:
                 json.dump(gap_plan, gf, ensure_ascii=False)
             try:
@@ -1923,7 +2171,7 @@ def cmd_scout(topic: str) -> None:
     t0 = time.time()
     planner = QueenPlanner(topic)
     plan = planner.plan()
-    plan_file = f'/tmp/hive_plan_{mission_id}.json'
+    plan_file = str(TMP_DIR / f'hive_plan_{mission_id}.json')
     with open(plan_file, 'w') as f:
         json.dump(plan, f, ensure_ascii=False, indent=2)
     log.debug(f'╚═══ Plan ready: {len(plan)} tasks → {plan_file} ({time.time()-t0:.1f}s) ═══╝\n')
@@ -1952,7 +2200,7 @@ def cmd_plan(topic: str, output_file: str | None = None) -> None:
     plan = planner.plan()
     elapsed = time.time() - t0
 
-    dest = output_file or f'/tmp/hive_plan_inspect_{int(time.time())}.json'
+    dest = output_file or str(TMP_DIR / f'hive_plan_inspect_{int(time.time())}.json')
     with open(dest, 'w') as f:
         json.dump(plan, f, ensure_ascii=False, indent=2)
 
@@ -1983,6 +2231,19 @@ def cmd_harvest(mission_id: str) -> None:
         log.info(f"[HIVE] Misja '{mission_id}' nie znaleziona w DB.")
         sys.exit(1)
     run_phase('hive2_harvest.py', [mission_id], 'harvest')
+    con = _connect_db(read_only=True)
+    source_count = con.execute("SELECT COUNT(*) FROM hive_sources WHERE mission_id=?", [mission_id]).fetchone()[0]
+    content_count = con.execute("SELECT COUNT(*) FROM hive_content WHERE mission_id=? AND word_count>0", [mission_id]).fetchone()[0]
+    con.close()
+    if content_count == 0:
+        content_count = _recover_snippet_content(mission_id)
+        log.warning(f"Recovery harvest used {content_count} labeled snippet documents")
+    if content_count < 5:
+        raise RuntimeError(f"Harvest recovery produced only {content_count} documents from {source_count} sources")
+    con = _connect_db()
+    con.execute("UPDATE hive_missions SET status='process',phase='process',sources_harvested=? WHERE id=?",
+                [content_count, mission_id])
+    con.commit(); con.close()
 
 
 # ── P3.7: --resume — checkpoint-based recovery ────────────────────────────────
@@ -2021,12 +2282,7 @@ def cmd_resume(mission_id: str) -> None:
     synth_row = con2.execute(
         "SELECT synthesis, status FROM hive_missions WHERE id=?", [mission_id]
     ).fetchone()
-    has_synth = bool(
-        synth_row and (
-            (synth_row[0] and len(synth_row[0]) > 500) or  # synthesis text w DB
-            (synth_row[1] == 'done')                        # status done
-        )
-    )
+    has_synth = bool(synth_row and synth_row[0] and len(synth_row[0]) > 500)
     con2.close()
 
     log.info(f"[HIVE]   sources znalezione:  {harvested}")
@@ -2080,7 +2336,29 @@ def cmd_process(mission_id: str) -> None:
     if not _get_mission(mission_id):
         log.info(f"[HIVE] Misja '{mission_id}' nie znaleziona w DB.")
         sys.exit(1)
+    con = _connect_db(read_only=True)
+    content_count = con.execute("SELECT COUNT(*) FROM hive_content WHERE mission_id=? AND word_count>0", [mission_id]).fetchone()[0]
+    con.close()
+    if content_count == 0:
+        raise RuntimeError("Process cannot run: no harvested or recovered documents")
     run_phase('hive2_process.py', [mission_id], 'process')
+    con = _connect_db(read_only=True)
+    claim_count = con.execute("SELECT COUNT(*) FROM hive_claims WHERE mission_id=?", [mission_id]).fetchone()[0]
+    con.close()
+    if claim_count == 0:
+        log.warning("Primary extractors produced no claims; running built-in evidence-linked fallback")
+        claim_count = _fallback_extract_claims(mission_id)
+    if claim_count == 0:
+        log.warning("No defensible findings; recording an insufficient-evidence outcome instead of a pipeline failure")
+        _record_insufficient_evidence(mission_id, content_count)
+        try:
+            from behive.engine.frontier import run_frontier_cycle
+            discovery = run_frontier_cycle(mission_id, trigger="insufficient_evidence")
+            log.info("[HIVE] Discovery frontier: %s nodes, %s frontiers, %s hypotheses",
+                     discovery["nodes_seen"], discovery["frontiers_added"], discovery["hypotheses_added"])
+        except Exception as exc:
+            log.warning("[HIVE] Discovery frontier failed without invalidating evidence state: %s", exc)
+        return
 
     # ── P2.4: Auto-pipe process → synth → falsify ─────────────────────────────
     log.info(f"\n[HIVE] ⚡ Auto-pipe: process → synth → falsify")
@@ -2091,6 +2369,14 @@ def cmd_process(mission_id: str) -> None:
         run_phase('hive2_falsifier.py', ['--mission', mission_id], 'falsify')
     except Exception as e:
         log.info(f"[HIVE] Falsifikacja failed ({e}) — raport już zapisany")
+
+    try:
+        from behive.engine.frontier import run_frontier_cycle
+        discovery = run_frontier_cycle(mission_id, trigger="post_process")
+        log.info("[HIVE] Discovery frontier: %s nodes, %s frontiers, %s hypotheses",
+                 discovery["nodes_seen"], discovery["frontiers_added"], discovery["hypotheses_added"])
+    except Exception as exc:
+        log.warning("[HIVE] Discovery frontier failed without invalidating research output: %s", exc)
 
 
 def cmd_synth(mission_id: str) -> None:
@@ -2106,6 +2392,14 @@ def cmd_synth(mission_id: str) -> None:
     con.close()
     if row:
         run_phase('hive2_synth.py', [mission_id], 'synth', timeout=900)
+        cmd_analyze(mission_id)
+
+
+def cmd_analyze(mission_id: str) -> dict:
+    """Run the evidence-aware Analyst core for an existing mission."""
+    from behive.engine.analyst import analyze_mission
+    log.info("[HIVE] Analyst core: comparison, mechanisms, scenarios, deductions, and gaps")
+    return analyze_mission(mission_id)
 
 
 def cleanup_stuck_missions(max_age_hours: int = 2) -> int:

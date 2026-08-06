@@ -206,7 +206,7 @@ class SwarmScout:
             "roblox.com", "twitch.tv", "youtube.com", "tiktok.com",
             "spotify.com", "netflix.com", "imdb.com",
             # Aggregators without content
-            "feedburner.com", "bit.ly", "tinyurl.com", "linktr.ee",
+            "feedburner.com", "bit.ly", "tinyurl.com", "linktr.ee", "news.google.com",
             # Job boards (nie B2B research)
             "indeed.com", "glassdoor.com", "pracuj.pl", "linkedin.com/jobs",
         }
@@ -253,6 +253,16 @@ class SwarmScout:
 
         self._seen_urls.add(url)
 
+        medical_terms = {"clinical", "disease", "drug", "therapy", "protein", "neural", "neuron",
+                         "brain", "cancer", "patient", "syndrome", "medicine", "medical", "als"}
+        medical_topic = any(term in self.topic.lower() for term in medical_terms)
+        authority_host = (_domain.endswith((".gov", ".edu", ".int")) or any(
+            trusted in _domain for trusted in ("nih.gov", "ncbi.nlm.nih.gov", "who.int", "europepmc.org")))
+        quarantine = medical_topic and source_type.lower() in {
+            "news", "rss", "gnews", "ddg", "social", "reddit", "wayback"
+        } and not authority_host
+        source_status = "quarantined" if quarantine else "scouted"
+
         domain = urlparse(url).netloc.lower().lstrip("www.")
         scores = self._score_source(url, title or "", snippet or "", source_type)
 
@@ -263,7 +273,7 @@ class SwarmScout:
                     (id, mission_id, url, domain, title, snippet, source_type,
                      score_total, score_relevance, score_freshness,
                      score_authority, score_depth, status, harvest_method)
-                VALUES (nextval('hive_sources_id_seq'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'scouted', ?)
+                VALUES (nextval('hive_sources_id_seq'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT DO NOTHING
                 """,
                 [
@@ -272,7 +282,7 @@ class SwarmScout:
                     source_type,
                     scores["score_total"], scores["score_relevance"],
                     scores["score_freshness"], scores["score_authority"],
-                    scores["score_depth"],
+                    scores["score_depth"], source_status,
                     scout_method,
                 ],
             )
@@ -727,6 +737,13 @@ def main() -> None:
         log.info(f"[hive2_scout] MODE=standalone  mission={mission_id}  topic={topic!r}  tasks={len(plan)}")
 
     scout = SwarmScout(mission_id, topic)
+    try:
+        from behive.engine.authority import ingest_authority_sources
+        authority = ingest_authority_sources(mission_id, topic)
+        log.info("[authority] %s verified, %s evidence-ready, %s tier-one",
+                 authority["verified_sources"], authority["evidence_ready"], authority["tier_one"])
+    except Exception as exc:
+        log.warning("[authority] registry discovery unavailable: %s", exc)
     total = asyncio.run(scout.execute_plan(plan))
     log.debug(f"\n✓ Scout done — {total} URLs discovered for mission {mission_id}")
 

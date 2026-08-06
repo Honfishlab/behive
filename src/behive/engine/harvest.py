@@ -15,6 +15,7 @@ import os
 import re
 import sys
 import time
+import tempfile
 import traceback
 from datetime import datetime, timezone
 from urllib.parse import urlparse
@@ -355,7 +356,7 @@ class HarvesterBee:
         # Maps url → routing_final (e.g. "skip", "api_bee", "pdf_drone", ...)
         self._routing_hints: dict[str, str] = {}
         self._prescout_skip: set[str]       = set()
-        _routing_path = f'/tmp/hive_routing_{mission_id}.json'
+        _routing_path = os.path.join(tempfile.gettempdir(), f'hive_routing_{mission_id}.json')
         if os.path.exists(_routing_path):
             try:
                 with open(_routing_path) as _f:
@@ -408,6 +409,15 @@ class HarvesterBee:
             [self.mission_id]
         ).fetchone()[0]
         log.info(f"Loaded {len(sources)} source(s) after relevance filter (total scouted: {total_pending}, filtered out: {total_pending - len(sources)})")
+
+        proxy_count = sum(1 for source in sources if _domain(source.get("url", "")) == "news.google.com")
+        if sources and proxy_count / len(sources) >= 0.9:
+            log.warning(
+                f"{proxy_count}/{len(sources)} sources are blocked Google News proxy URLs; "
+                "skipping futile page fetches so checkpoint recovery can use labeled snippets"
+            )
+            self._finalize(0)
+            return
 
         # ── REC-01: Quorum check (waggle dance gate) ───────────────────────────
         try:
@@ -979,7 +989,8 @@ class HarvesterBee:
                   AND status IN ('pending', 'scouted')
                   AND score_relevance >= 2
                   AND score_total >= 15
-                ORDER BY score_total DESC NULLS LAST
+                ORDER BY COALESCE(evidence_tier, 9) ASC, score_authority DESC NULLS LAST,
+                         score_total DESC NULLS LAST
                 LIMIT 300
             """, [self.mission_id]).fetchall()
             if not rows:
@@ -990,7 +1001,8 @@ class HarvesterBee:
                     FROM hive_sources
                     WHERE mission_id = ?
                       AND status IN ('pending', 'scouted')
-                    ORDER BY score_total DESC NULLS LAST
+                    ORDER BY COALESCE(evidence_tier, 9) ASC, score_authority DESC NULLS LAST,
+                             score_total DESC NULLS LAST
                     LIMIT 100
                 """, [self.mission_id]).fetchall()
             cols = ["source_id", "url", "source_type", "score_total", "score_relevance"]
@@ -1008,9 +1020,9 @@ class HarvesterBee:
                     try:
                         wcon.execute("""
                             INSERT INTO hive_content
-                                (id, mission_id, url, domain, raw_text, word_count,
+                                (mission_id, url, domain, raw_text, word_count,
                                  language, quality_score, harvest_method, harvested_at)
-                            VALUES (nextval('hive_content_seq'), ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """, [
                             self.mission_id, r["url"], r.get("domain", ""),
                             r["text"], r["word_count"], r.get("language", "unknown"),
@@ -1046,9 +1058,9 @@ class HarvesterBee:
                         try:
                             wcon.execute("""
                                 INSERT INTO hive_content
-                                    (id, mission_id, url, domain, raw_text, word_count,
+                                    (mission_id, url, domain, raw_text, word_count,
                                      language, quality_score, harvest_method, harvested_at)
-                                VALUES (nextval('hive_content_seq'), ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                             """, [
                                 self.mission_id,
                                 r["url"],

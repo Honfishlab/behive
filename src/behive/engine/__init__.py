@@ -36,6 +36,12 @@ Usage:
 """
 import logging
 
+from behive.config import load_project_env
+
+# Package shims import database modules immediately, so configuration must be
+# loaded before installing them.
+load_project_env()
+
 log = logging.getLogger(__name__)
 
 # Auto-install compat shims so hive2_* imports resolve to behive.engine.*

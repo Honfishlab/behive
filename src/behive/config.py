@@ -20,6 +20,27 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+
+def load_project_env(start_dir: Optional[Path] = None) -> Optional[Path]:
+    """Load the nearest project .env without overwriting process variables."""
+    start = (start_dir or Path.cwd()).resolve()
+    for directory in (start, *start.parents):
+        env_file = directory / ".env"
+        if not env_file.is_file():
+            continue
+        for raw_line in env_file.read_text(encoding="utf-8-sig").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key, value = key.strip(), value.strip()
+            if value[:1] == value[-1:] and value[:1] in {'"', "'"}:
+                value = value[1:-1]
+            if key:
+                os.environ.setdefault(key, value)
+        return env_file
+    return None
+
 # ─── Defaults ─────────────────────────────────────────────────────────────────
 
 CONFIG_DIR = Path(os.environ.get("BEHIVE_CONFIG_DIR", Path.home() / ".behive"))

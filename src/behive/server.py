@@ -7,11 +7,14 @@ import json
 import hashlib
 import asyncio
 from collections import defaultdict, Counter
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from typing import Optional, AsyncGenerator
 
 from fastapi import FastAPI, HTTPException, Request, Depends, Query
 from behive import __version__ as BEHIVE_VERSION
+from behive.config import load_project_env
+
+load_project_env()
 
 # ─── Concurrency control ──────────────────────────────────────────────────────
 _MAX_CONCURRENT_MISSIONS = int(os.environ.get("BEHIVE_MAX_CONCURRENT", "3"))
@@ -125,6 +128,40 @@ _research_limiter = TokenBucket(rate=5, per=60)
 
 # ─── App ──────────────────────────────────────────────────────────────────────
 
+_continuous_discovery_task: asyncio.Task | None = None
+
+
+async def _continuous_discovery_loop():
+    """Advance continuous projects on their configured cadence without user prompts."""
+    await asyncio.sleep(15)
+    while True:
+        try:
+            from behive.engine.frontier import ensure_schema
+            await asyncio.to_thread(ensure_schema)
+            conn = get_db(); cur = conn.cursor()
+            cur.execute("""
+                SELECT DISTINCT ON (p.id) m.id,p.cadence_minutes
+                FROM hive_projects p JOIN hive_missions m ON LOWER(TRIM(m.topic))=LOWER(TRIM(p.root_question))
+                LEFT JOIN hive_discovery_cycles dc ON dc.mission_id=m.id
+                WHERE COALESCE(p.agent_policy->>'autonomy','assisted')='continuous'
+                  AND m.status IN ('done','insufficient')
+                GROUP BY p.id,m.id,p.cadence_minutes,m.created_at
+                HAVING MAX(dc.completed_at) IS NULL OR
+                       MAX(dc.completed_at) < NOW()-(GREATEST(15,p.cadence_minutes)||' minutes')::interval
+                ORDER BY p.id,m.created_at DESC
+                LIMIT 2
+            """)
+            due = cur.fetchall(); conn.close()
+            for mission_id, _cadence in due:
+                task = _frontier_tasks.get(mission_id)
+                if not task or task.done():
+                    _frontier_tasks[mission_id] = asyncio.create_task(
+                        _run_frontier_background(mission_id, "continuous_cadence"))
+        except Exception as exc:
+            print(f"Continuous discovery scheduler warning: {exc}")
+        await asyncio.sleep(300)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan — check DB connectivity on startup."""
@@ -142,7 +179,13 @@ async def lifespan(app: FastAPI):
         print("   Run: behive init-db")
     except Exception as e:
         print(f"⚠️  Database check failed: {e}")
+    global _continuous_discovery_task
+    _continuous_discovery_task = asyncio.create_task(_continuous_discovery_loop())
     yield
+    if _continuous_discovery_task:
+        _continuous_discovery_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await _continuous_discovery_task
     print("🐝 BeHive API shutdown.")
 
 
@@ -195,6 +238,8 @@ except ImportError:
 
 _mission_events: dict[str, list[dict]] = defaultdict(list)
 _mission_subscribers: dict[str, list[asyncio.Queue]] = defaultdict(list)
+_mission_runtime: dict[str, dict] = {}
+_gap_processes: dict[int, asyncio.subprocess.Process] = {}
 
 
 def _emit_event(mission_id: str, event: str, data: dict):
@@ -251,6 +296,10 @@ class HealthResponse(BaseModel):
     claims_total: int = 0
     avg_quality: float = 0.0
     db: str = ""
+
+
+class GapUpdate(BaseModel):
+    question: str = Field(..., min_length=8, max_length=1000)
 
 
 # ─── Entity Extraction (lightweight NLP) ─────────────────────────────────────
@@ -369,31 +418,126 @@ async def start_research(req: ResearchRequest):
 
 @app.get("/research/{mission_id}/status")
 async def research_status(mission_id: str):
-    """Get mission status and progress."""
+    """Get mission status, progress, and watchdog diagnostics."""
     try:
         conn = get_db()
         cur = conn.cursor()
-        cur.execute("SELECT status, phase, topic FROM hive_missions WHERE id = %s", (mission_id,))
+        cur.execute(
+            "SELECT status,phase,topic,EXTRACT(EPOCH FROM NOW()-created_at) "
+            "FROM hive_missions WHERE id = %s", (mission_id,)
+        )
         row = cur.fetchone()
         if not row:
             conn.close()
             raise HTTPException(404, f"Mission {mission_id} not found")
-        status, phase, topic = row
+        status, phase, topic, mission_age = row
         # Get current claims count
         cur.execute(
             "SELECT COUNT(*), COALESCE(AVG(quality_score), 0) FROM hive_claims WHERE mission_id = %s AND (is_garbage = false OR is_garbage IS NULL)",
             (mission_id,)
         )
         crow = cur.fetchone()
+        cur.execute("SELECT COUNT(*) FROM hive_sources WHERE mission_id = %s", (mission_id,))
+        source_count = cur.fetchone()[0] or 0
+        cur.execute("SELECT COUNT(*) FROM hive_content WHERE mission_id = %s AND word_count > 0", (mission_id,))
+        content_count = cur.fetchone()[0] or 0
         conn.close()
+        claims_count = crow[0] or 0
+        age_seconds = max(0, int(float(mission_age or 0)))
+        runtime = _mission_runtime.get(mission_id)
+        run_age_seconds = max(0, int(time.time() - runtime["started_at"])) if runtime and runtime.get("started_at") else age_seconds
+        terminal = status in ("done", "insufficient", "error", "cancelled", "interrupted")
+        checks = []
+
+        if runtime and runtime.get("last_output_at"):
+            silent_seconds = max(0, int(time.time() - runtime["last_output_at"]))
+            heartbeat_state = "pass" if silent_seconds <= 180 else "warn" if silent_seconds <= 600 else "fail"
+            heartbeat_detail = f"Worker output {silent_seconds}s ago"
+        elif terminal:
+            heartbeat_state, heartbeat_detail = "pass", "Worker exited"
+            silent_seconds = None
+        else:
+            heartbeat_state = "unknown" if age_seconds <= 300 else "fail"
+            heartbeat_detail = "No server heartbeat available" if age_seconds > 300 else "Heartbeat starting"
+            silent_seconds = None
+        checks.append({"id": "heartbeat", "label": "Worker heartbeat", "state": heartbeat_state, "detail": heartbeat_detail})
+
+        pipeline_phases = ("planning", "scout", "harvest", "process", "falsify", "synth", "graph")
+        inconsistent = status in pipeline_phases and phase in pipeline_phases and status != phase
+        phase_state = "fail" if inconsistent and age_seconds > 600 else "warn" if inconsistent else "pass"
+        phase_detail = f"Status {status} disagrees with phase {phase}" if inconsistent else f"State synchronized at {phase or status}"
+        checks.append({"id": "phase", "label": "Phase consistency", "state": phase_state, "detail": phase_detail})
+
+        downstream = status in ("process", "falsify", "synth", "graph", "done", "partial")
+        flow_failed = source_count > 0 and claims_count == 0 and (downstream or (not terminal and not runtime and age_seconds > 900))
+        flow_state = "fail" if flow_failed else "warn" if status == "insufficient" else "pass" if claims_count > 0 else "pending"
+        flow_detail = f"{source_count} sources → {content_count} documents → {claims_count} findings"
+        checks.append({"id": "flow", "label": "Source-to-finding flow", "state": flow_state, "detail": flow_detail})
+
+        result_state = "warn" if status == "insufficient" else "fail" if status == "done" and claims_count == 0 else "pass" if claims_count > 0 else "pending"
+        result_detail = ("No defensible findings met the evidence threshold" if status == "insufficient" else
+                         f"{claims_count} findings produced" if claims_count else "No findings produced yet")
+        checks.append({"id": "results", "label": "Result production", "state": result_state, "detail": result_detail})
+
+        completion_state = "pass" if status in ("done", "insufficient") else "fail" if status in ("error", "cancelled", "interrupted") or (not terminal and run_age_seconds > 3600) else "pending"
+        completion_detail = ("Mission completed" if status == "done" else
+                             "Mission completed with insufficient evidence" if status == "insufficient" else
+                             f"Mission ended: {status}" if terminal else f"Current attempt active for {run_age_seconds // 60}m")
+        checks.append({"id": "completion", "label": "Full mission completion", "state": completion_state, "detail": completion_detail})
+        severity = {"unknown": 0, "pending": 1, "pass": 1, "warn": 2, "fail": 3}
+        watchdog_state = max(checks, key=lambda item: severity[item["state"]])["state"]
         return {
             "mission_id": mission_id,
             "status": status,
             "phase": phase,
             "topic": topic,
-            "claims_so_far": crow[0] or 0,
+            "claims_so_far": claims_count,
+            "sources_so_far": source_count,
+            "documents_so_far": content_count,
             "avg_quality": round(float(crow[1] or 0), 4),
+            "watchdog": {"state": watchdog_state, "mission_age_seconds": age_seconds,
+                         "run_age_seconds": run_age_seconds,
+                         "silent_seconds": silent_seconds, "checks": checks},
         }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.post("/research/{mission_id}/recover")
+async def recover_research(mission_id: str):
+    """Resume an incomplete mission from the first missing durable checkpoint."""
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT topic FROM hive_missions WHERE id=%s", (mission_id,))
+        row = cur.fetchone()
+        if not row:
+            conn.close()
+            raise HTTPException(404, f"Mission {mission_id} not found")
+        cur.execute("SELECT COUNT(*) FROM hive_sources WHERE mission_id=%s", (mission_id,))
+        sources = cur.fetchone()[0] or 0
+        cur.execute("SELECT COUNT(*) FROM hive_content WHERE mission_id=%s AND word_count>0", (mission_id,))
+        content = cur.fetchone()[0] or 0
+        cur.execute("SELECT COUNT(*) FROM hive_claims WHERE mission_id=%s", (mission_id,))
+        claims = cur.fetchone()[0] or 0
+        cur.execute("SELECT LENGTH(COALESCE(synthesis,'')) FROM hive_missions WHERE id=%s", (mission_id,))
+        synthesis_length = cur.fetchone()[0] or 0
+        stage = "scout" if sources == 0 else "harvest" if content == 0 else "process" if claims == 0 else "synth" if synthesis_length < 100 else "done"
+        if stage == "done":
+            conn.close()
+            return {"mission_id": mission_id, "status": "done", "recovery_stage": "none"}
+        cur.execute(
+            "UPDATE hive_missions SET status=%s,phase=%s,quality_metrics="
+            "COALESCE(quality_metrics,'{}'::jsonb)-'error_message' WHERE id=%s",
+            (stage, stage, mission_id),
+        )
+        conn.commit()
+        conn.close()
+        asyncio.create_task(_run_recovery(mission_id, stage))
+        return {"mission_id": mission_id, "status": "recovering", "recovery_stage": stage,
+                "checkpoints": {"sources": sources, "content": content, "claims": claims}}
     except HTTPException:
         raise
     except Exception as e:
@@ -495,7 +639,7 @@ async def get_report(mission_id: str):
         )
         crow = cur.fetchone()
         conn.close()
-        if status != "done":
+        if status not in ("done", "insufficient"):
             raise HTTPException(202, f"Mission still in progress (status={status})")
         return {
             "mission_id": mission_id,
@@ -511,6 +655,332 @@ async def get_report(mission_id: str):
 
 
 # ─── 7. Search Claims (primary path) ─────────────────────────────────────────
+
+@app.get("/research/{mission_id}/evidence")
+async def get_research_evidence(mission_id: str):
+    """Return the mission library and a deduplicated bibliography."""
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM hive_missions WHERE id=%s", (mission_id,))
+        if not cur.fetchone():
+            conn.close()
+            raise HTTPException(404, f"Mission {mission_id} not found")
+        cur.execute("""
+            SELECT c.title, c.url, c.domain, c.word_count, c.harvest_method,
+                   c.quality_score, c.author, c.published_date, c.harvested_at,
+                   COUNT(cl.id) AS claim_count, MIN(s.evidence_tier),
+                   MAX(s.verification_status), MAX(s.persistent_id),
+                   BOOL_OR(COALESCE(s.is_primary,FALSE)), BOOL_OR(COALESCE(s.is_open_access,FALSE))
+            FROM hive_content c
+            LEFT JOIN hive_claims cl ON cl.mission_id=c.mission_id AND cl.source_url=c.url
+              AND (cl.is_garbage=false OR cl.is_garbage IS NULL)
+            LEFT JOIN hive_sources s ON s.mission_id=c.mission_id AND s.url=c.url
+            WHERE c.mission_id=%s
+            GROUP BY c.id, c.title, c.url, c.domain, c.word_count, c.harvest_method,
+                     c.quality_score, c.author, c.published_date, c.harvested_at
+            ORDER BY COUNT(cl.id) DESC, c.quality_score DESC, c.harvested_at DESC
+            LIMIT 500
+        """, (mission_id,))
+        library = [{"title": r[0] or r[2] or r[1], "url": r[1], "domain": r[2] or "",
+                    "word_count": r[3] or 0, "harvest_method": r[4] or "unknown",
+                    "quality_score": float(r[5] or 0), "author": r[6] or "",
+                    "published_date": r[7] or "", "harvested_at": r[8].isoformat() if r[8] else "",
+                    "claim_count": r[9] or 0, "evidence_tier": r[10],
+                    "verification_status": r[11] or "unverified", "persistent_id": r[12] or "",
+                    "is_primary": bool(r[13]), "is_open_access": bool(r[14])} for r in cur.fetchall()]
+        conn.close()
+        bibliography = [{"number": i + 1, "title": item["title"], "url": item["url"],
+                         "domain": item["domain"], "author": item["author"],
+                         "published_date": item["published_date"], "accessed_at": item["harvested_at"],
+                         "supports_findings": item["claim_count"], "evidence_tier": item["evidence_tier"],
+                         "verification_status": item["verification_status"],
+                         "persistent_id": item["persistent_id"], "is_primary": item["is_primary"]}
+                        for i, item in enumerate(library)]
+        return {"mission_id": mission_id, "library": library, "bibliography": bibliography,
+                "metrics": {"documents": len(library), "cited_sources": sum(x["claim_count"] > 0 for x in library),
+                            "registry_verified": sum(x["verification_status"] == "registry_verified" for x in library),
+                            "tier_one": sum(x["evidence_tier"] == 1 for x in library)}}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+_frontier_tasks: dict[str, asyncio.Task] = {}
+
+
+class DiscoveryStateUpdate(BaseModel):
+    status: str = Field(pattern="^(open|investigating|paused|rejected|supported|superseded|resolved)$")
+
+
+async def _run_frontier_background(mission_id: str, trigger: str):
+    try:
+        from behive.engine.frontier import run_frontier_cycle
+        _emit_event(mission_id, "discovery", {"state": "mapping", "message": "Mapping observations and evidence edges"})
+        result = await asyncio.to_thread(run_frontier_cycle, mission_id, trigger)
+        _emit_event(mission_id, "discovery", {"state": "complete", **result})
+    except Exception as exc:
+        _emit_event(mission_id, "discovery", {"state": "failed", "message": str(exc)})
+    finally:
+        _frontier_tasks.pop(mission_id, None)
+
+
+@app.get("/research/{mission_id}/discovery")
+async def get_discovery(mission_id: str):
+    """Return the open-world evidence graph, unknowns, and hypothesis portfolio."""
+    try:
+        from behive.engine.frontier import get_discovery_map
+        result = await asyncio.to_thread(get_discovery_map, mission_id)
+        task = _frontier_tasks.get(mission_id)
+        result["active"] = bool(task and not task.done())
+        return result
+    except Exception as exc:
+        raise HTTPException(500, str(exc))
+
+
+@app.post("/research/{mission_id}/discovery/cycles")
+async def start_discovery_cycle(mission_id: str):
+    """Start another autonomous map-gap-hypothesize-discriminate cycle."""
+    task = _frontier_tasks.get(mission_id)
+    if task and not task.done():
+        raise HTTPException(409, "A discovery cycle is already active")
+    conn = get_db(); cur = conn.cursor()
+    cur.execute("SELECT 1 FROM hive_missions WHERE id=%s", (mission_id,))
+    exists = cur.fetchone(); conn.close()
+    if not exists:
+        raise HTTPException(404, f"Mission {mission_id} not found")
+    _frontier_tasks[mission_id] = asyncio.create_task(_run_frontier_background(mission_id, "user_or_autonomous_cycle"))
+    return {"mission_id": mission_id, "status": "queued", "mode": "open_world_discovery"}
+
+
+@app.patch("/research/{mission_id}/frontiers/{frontier_id}")
+async def update_frontier_state(mission_id: str, frontier_id: str, body: DiscoveryStateUpdate):
+    from behive.engine.frontier import ensure_schema
+    ensure_schema(); conn = get_db(); cur = conn.cursor()
+    cur.execute("UPDATE hive_frontiers SET status=%s,updated_at=NOW() WHERE id=%s AND mission_id=%s RETURNING id",
+                (body.status, frontier_id, mission_id))
+    row = cur.fetchone(); conn.commit(); conn.close()
+    if not row: raise HTTPException(404, "Frontier not found")
+    return {"id": frontier_id, "status": body.status}
+
+
+@app.patch("/research/{mission_id}/hypotheses/{hypothesis_id}")
+async def update_hypothesis_state(mission_id: str, hypothesis_id: str, body: DiscoveryStateUpdate):
+    from behive.engine.frontier import ensure_schema
+    ensure_schema(); conn = get_db(); cur = conn.cursor()
+    cur.execute("UPDATE hive_hypothesis_paths SET status=%s,updated_at=NOW() WHERE id=%s AND mission_id=%s RETURNING id",
+                (body.status, hypothesis_id, mission_id))
+    row = cur.fetchone(); conn.commit(); conn.close()
+    if not row: raise HTTPException(404, "Hypothesis not found")
+    return {"id": hypothesis_id, "status": body.status}
+
+
+class HypothesisEvidenceUpdate(BaseModel):
+    direction: str = Field(pattern="^(supports|weakens|contradicts|non_discriminating|context_limits)$")
+    weight: float = Field(default=.5, ge=0, le=1)
+    reason: str = Field(min_length=3, max_length=3000)
+    evidence_edge_id: str = ""
+    evidence_url: str = ""
+    conditions: dict = Field(default_factory=dict)
+
+
+class ExperimentStateUpdate(BaseModel):
+    status: str = Field(pattern="^(proposed|queued|running|completed|inconclusive|cancelled)$")
+
+
+@app.get("/research/{mission_id}/evolution")
+async def get_hypothesis_evolution(mission_id: str):
+    try:
+        from behive.engine.evolution import get_evolution
+        return await asyncio.to_thread(get_evolution, mission_id)
+    except Exception as exc:
+        raise HTTPException(500, str(exc))
+
+
+@app.post("/research/{mission_id}/evolution/generations")
+async def evolve_hypothesis_population(mission_id: str):
+    try:
+        from behive.engine.evolution import evolve_hypotheses
+        result = await asyncio.to_thread(evolve_hypotheses, mission_id, "api_generation")
+        return {"mission_id": mission_id, **result}
+    except Exception as exc:
+        raise HTTPException(500, str(exc))
+
+
+@app.post("/research/{mission_id}/hypothesis-versions/{version_id}/evidence")
+async def apply_hypothesis_evidence(mission_id: str, version_id: str, body: HypothesisEvidenceUpdate):
+    try:
+        from behive.engine.evolution import update_hypothesis
+        return await asyncio.to_thread(update_hypothesis, mission_id, version_id, body.direction,
+                                       body.weight, body.reason, body.evidence_edge_id,
+                                       body.evidence_url, body.conditions)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    except Exception as exc:
+        raise HTTPException(500, str(exc))
+
+
+@app.get("/research/{mission_id}/counterfactual/{subject_id}")
+async def inspect_counterfactual(mission_id: str, subject_id: str):
+    try:
+        from behive.engine.evolution import counterfactual
+        return await asyncio.to_thread(counterfactual, mission_id, subject_id)
+    except Exception as exc:
+        raise HTTPException(500, str(exc))
+
+
+@app.post("/research/{mission_id}/graph-audits")
+async def run_graph_audit(mission_id: str):
+    try:
+        from behive.engine.evolution import audit_graph
+        return await asyncio.to_thread(audit_graph, mission_id)
+    except Exception as exc:
+        raise HTTPException(500, str(exc))
+
+
+@app.patch("/research/{mission_id}/experiments/{experiment_id}")
+async def update_experiment_state(mission_id: str, experiment_id: str, body: ExperimentStateUpdate):
+    from behive.engine.evolution import ensure_schema
+    ensure_schema(); conn=get_db(); cur=conn.cursor()
+    cur.execute("UPDATE hive_discovery_experiments SET status=%s,updated_at=NOW() WHERE id=%s AND mission_id=%s RETURNING id",
+                (body.status,experiment_id,mission_id))
+    row=cur.fetchone(); conn.commit(); conn.close()
+    if not row: raise HTTPException(404,"Experiment not found")
+    return {"id":experiment_id,"status":body.status}
+
+
+@app.get("/research/{mission_id}/analysis")
+async def get_research_analysis(mission_id: str):
+    """Return structured Analyst-core output without blending inference into findings."""
+    try:
+        from behive.engine.analyst import ANALYSIS_SCHEMA
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute(ANALYSIS_SCHEMA)
+        conn.commit()
+        cur.execute("SELECT analysis,depth_status,source_count,cited_source_count,claim_count,updated_at FROM hive_analysis WHERE mission_id=%s", (mission_id,))
+        row = cur.fetchone()
+        conn.close()
+        if not row:
+            raise HTTPException(404, "Deep analysis has not been generated for this mission")
+        return {"mission_id": mission_id, "analysis": row[0], "depth_status": row[1],
+                "source_count": row[2], "cited_source_count": row[3], "claim_count": row[4],
+                "updated_at": row[5].isoformat() if row[5] else ""}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.get("/research/{mission_id}/gaps")
+async def get_research_gaps(mission_id: str):
+    """List Analyst gaps with their latest independent deepening checkpoint."""
+    try:
+        from behive.engine.deepening import ensure_schema
+        ensure_schema()
+        conn = get_db(); cur = conn.cursor()
+        cur.execute("""
+            SELECT g.id,g.gap_query,g.gap_type,g.priority,g.resolved,
+                   r.id,r.child_mission_id,r.status,r.target_sources,r.target_primary,
+                   r.full_text_sources,r.primary_sources,r.merged_claims,r.message,r.updated_at,
+                   cm.status,cm.phase
+            FROM hive_gaps g
+            LEFT JOIN LATERAL (
+              SELECT * FROM hive_gap_runs WHERE gap_id=g.id ORDER BY id DESC LIMIT 1
+            ) r ON TRUE
+            LEFT JOIN hive_missions cm ON cm.id=r.child_mission_id
+            WHERE g.mission_id=%s AND COALESCE(g.gap_type,'')='analyst'
+            ORDER BY g.resolved,g.priority DESC,g.id
+        """, (mission_id,))
+        rows = cur.fetchall(); conn.close()
+        def displayed_status(row):
+            if row[4]: return "resolved"
+            stored = row[7] or "open"
+            if stored not in {"queued", "scouting", "harvesting", "extracting", "evaluating"}: return stored
+            phase = (row[15] or row[16] or "").lower()
+            return ({"planning": "scouting", "running": "scouting", "scout": "scouting", "harvest": "harvesting",
+                     "process": "extracting", "falsify": "evaluating", "synth": "evaluating", "analyze": "evaluating"}.get(phase, stored))
+        return {"mission_id": mission_id, "gaps": [{
+            "id": r[0], "question": r[1], "type": r[2], "priority": r[3], "resolved": r[4],
+            "run_id": r[5], "child_mission_id": r[6], "status": displayed_status(r),
+            "target_sources": r[8] or 3, "target_primary": r[9] or 1,
+            "full_text_sources": r[10] or 0, "primary_sources": r[11] or 0,
+            "merged_claims": r[12] or 0, "message": r[13] or "Ready for targeted research",
+            "updated_at": r[14].isoformat() if r[14] else "",
+        } for r in rows]}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.patch("/research/{mission_id}/gaps/{gap_id}")
+async def edit_research_gap(mission_id: str, gap_id: int, body: GapUpdate):
+    conn = get_db(); cur = conn.cursor()
+    cur.execute("UPDATE hive_gaps SET gap_query=%s,resolved=FALSE WHERE id=%s AND mission_id=%s RETURNING id",
+                (body.question.strip(), gap_id, mission_id))
+    if not cur.fetchone():
+        conn.close(); raise HTTPException(404, "Research gap not found")
+    conn.commit(); conn.close()
+    return {"id": gap_id, "question": body.question.strip(), "status": "open"}
+
+
+@app.post("/research/{mission_id}/gaps/{gap_id}/deepen")
+async def deepen_research_gap(mission_id: str, gap_id: int):
+    from behive.engine.deepening import create_run, ensure_schema
+    ensure_schema()
+    conn = get_db(); cur = conn.cursor()
+    cur.execute("SELECT gap_query FROM hive_gaps WHERE id=%s AND mission_id=%s", (gap_id, mission_id))
+    row = cur.fetchone()
+    if not row:
+        conn.close(); raise HTTPException(404, "Research gap not found")
+    cur.execute("SELECT id FROM hive_gap_runs WHERE gap_id=%s AND status IN ('queued','scouting','harvesting','extracting','evaluating') ORDER BY id DESC LIMIT 1", (gap_id,))
+    active = cur.fetchone(); conn.close()
+    if active:
+        raise HTTPException(409, f"Gap already has active run {active[0]}")
+    child_id = f"gap_{mission_id[-10:]}_{gap_id}_{int(time.time())}"
+    run_id = create_run(gap_id, mission_id, child_id)
+    asyncio.create_task(_run_gap_deepening(run_id, mission_id, gap_id, child_id, row[0]))
+    return {"run_id": run_id, "gap_id": gap_id, "child_mission_id": child_id, "status": "queued"}
+
+
+@app.post("/research/{mission_id}/gaps/{gap_id}/pause")
+async def pause_research_gap(mission_id: str, gap_id: int):
+    from behive.engine.deepening import ensure_schema, update_run
+    ensure_schema(); conn = get_db(); cur = conn.cursor()
+    cur.execute("SELECT id FROM hive_gap_runs WHERE gap_id=%s AND parent_mission_id=%s AND status IN ('queued','scouting','harvesting','extracting','evaluating') ORDER BY id DESC LIMIT 1", (gap_id, mission_id))
+    row = cur.fetchone(); conn.close()
+    if not row: raise HTTPException(409, "No active gap run")
+    proc = _gap_processes.get(row[0])
+    if proc and proc.returncode is None:
+        if os.name == "nt":
+            import subprocess as _subprocess
+            _subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True)
+        else:
+            proc.terminate()
+    update_run(row[0], "paused", "Paused by user; checkpoint retained")
+    return {"run_id": row[0], "status": "paused"}
+
+
+@app.post("/research/{mission_id}/gaps/{gap_id}/dismiss")
+async def dismiss_research_gap(mission_id: str, gap_id: int):
+    conn = get_db(); cur = conn.cursor()
+    cur.execute("UPDATE hive_gaps SET resolved=TRUE WHERE id=%s AND mission_id=%s RETURNING id", (gap_id, mission_id))
+    if not cur.fetchone(): conn.close(); raise HTTPException(404, "Research gap not found")
+    conn.commit(); conn.close()
+    return {"gap_id": gap_id, "status": "dismissed"}
+
+
+@app.get("/research/{mission_id}/analysis/revisions")
+async def get_analysis_revisions(mission_id: str):
+    from behive.engine.deepening import ensure_schema
+    ensure_schema(); conn = get_db(); cur = conn.cursor()
+    cur.execute("SELECT id,gap_run_id,change_reason,created_at,previous_analysis,new_analysis FROM hive_analysis_revisions WHERE mission_id=%s ORDER BY id DESC LIMIT 50", (mission_id,))
+    rows = cur.fetchall(); conn.close()
+    return {"mission_id": mission_id, "revisions": [{"id": r[0], "gap_run_id": r[1], "reason": r[2],
+            "created_at": r[3].isoformat() if r[3] else "", "previous_depth": (r[4] or {}).get("depth_status"),
+            "new_depth": (r[5] or {}).get("depth_status"), "previous_claims": (r[4] or {}).get("evidence_metrics",{}).get("claims",0),
+            "new_claims": (r[5] or {}).get("evidence_metrics",{}).get("claims",0)} for r in rows]}
+
 
 @app.get("/claims/search")
 async def search_claims(q: str, limit: int = Query(20, ge=1, le=100)):
@@ -874,11 +1344,118 @@ async def _run_pipeline(mission_id: str, topic: str, depth: int):
         await _run_pipeline_inner(mission_id, topic, depth)
 
 
+async def _run_recovery(mission_id: str, stage: str):
+    """Run checkpoint recovery using the same interpreter and stream heartbeat."""
+    import sys
+    _mission_runtime[mission_id] = {"started_at": time.time(), "last_output_at": time.time(),
+                                    "phase": stage, "returncode": None, "recovery": True}
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-m", "behive.engine", "resume", "--mission-id", mission_id,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            env={**os.environ, "BEHIVE_MISSION_ID": mission_id, "PYTHONUNBUFFERED": "1"},
+        )
+        async for line in proc.stdout:
+            _mission_runtime[mission_id]["last_output_at"] = time.time()
+        await proc.wait()
+        _mission_runtime[mission_id]["returncode"] = proc.returncode
+        conn = get_db(); cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM hive_content WHERE mission_id=%s AND word_count>0", (mission_id,))
+        content = cur.fetchone()[0] or 0
+        cur.execute("SELECT COUNT(*) FROM hive_claims WHERE mission_id=%s", (mission_id,))
+        claims = cur.fetchone()[0] or 0
+        cur.execute("SELECT status,LENGTH(COALESCE(synthesis,'')) FROM hive_missions WHERE id=%s", (mission_id,))
+        mission_row = cur.fetchone() or (None, 0)
+        engine_status, synthesis_length = mission_row[0], mission_row[1] or 0
+        if proc.returncode == 0 and engine_status == "insufficient":
+            pass
+        elif proc.returncode == 0 and content > 0 and claims > 0:
+            final_status = "done" if synthesis_length >= 100 else "partial"
+            cur.execute("UPDATE hive_missions SET status=%s,phase=%s WHERE id=%s",
+                        (final_status, final_status, mission_id))
+        else:
+            cur.execute(
+                "UPDATE hive_missions SET status='error',phase='error',quality_metrics="
+                "COALESCE(quality_metrics,'{}'::jsonb)||jsonb_build_object('error_message',%s) WHERE id=%s",
+                (f"Recovery from {stage} failed: exit={proc.returncode}, content={content}, claims={claims}", mission_id),
+            )
+        conn.commit(); conn.close()
+    except Exception as exc:
+        _mission_runtime[mission_id]["error"] = str(exc)
+        try:
+            conn = get_db(); cur = conn.cursor()
+            cur.execute("UPDATE hive_missions SET status='error',phase='error' WHERE id=%s", (mission_id,))
+            conn.commit(); conn.close()
+        except Exception:
+            pass
+
+
+async def _run_gap_deepening(run_id: int, parent_id: str, gap_id: int, child_id: str, question: str):
+    """Run a narrow child mission, merge only qualified evidence, and selectively re-analyze."""
+    import sys
+    from behive.engine.deepening import merge_qualified_evidence, save_revision, update_run
+    try:
+        update_run(run_id, "scouting", "Searching specifically for primary and full-text evidence")
+        targeted_question = (question + " Prioritize primary evidence: government and academic datasets, "
+                             "peer-reviewed studies, official company filings, and original research reports. "
+                             "Avoid news aggregators and search-result summaries.")
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-m", "behive.engine", "run", targeted_question,
+            "--mission-id", child_id, "--depth", "4", "--scale", "40", "--force",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            env={**os.environ, "BEHIVE_MISSION_ID": child_id, "PYTHONUNBUFFERED": "1",
+                 "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8",
+                 "BEHIVE_GAP_RUN_ID": str(run_id), "BEHIVE_REQUIRE_PRIMARY": "1"},
+        )
+        _gap_processes[run_id] = proc
+        output_tail = []
+        async for raw in proc.stdout:
+            rendered = raw.decode(errors="replace").strip()
+            output_tail = (output_tail + [rendered])[-8:]
+            text = rendered.lower()
+            if "harvest" in text:
+                update_run(run_id, "harvesting", "Retrieving candidate full-text sources")
+            elif "process" in text or "extract" in text:
+                update_run(run_id, "extracting", "Extracting claims from qualified evidence")
+        await proc.wait()
+        conn = get_db(); cur = conn.cursor()
+        cur.execute("SELECT status FROM hive_gap_runs WHERE id=%s", (run_id,))
+        checkpoint_status = (cur.fetchone() or [None])[0]; conn.close()
+        if checkpoint_status == "paused":
+            return
+        if proc.returncode != 0:
+            detail = " | ".join(line for line in output_tail if line)[-450:]
+            update_run(run_id, "failed", f"Deep research worker exited with code {proc.returncode}: {detail}")
+            return
+        update_run(run_id, "evaluating", "Applying full-text, independence, and primary-source gates")
+        conn = get_db(); cur = conn.cursor()
+        cur.execute("SELECT analysis FROM hive_analysis WHERE mission_id=%s", (parent_id,))
+        old_row = cur.fetchone(); previous = old_row[0] if old_row else None
+        conn.close()
+        metrics = merge_qualified_evidence(run_id)
+        if metrics["merged_claims"] > 0:
+            from behive.engine.analyst import analyze_mission
+            current = await asyncio.to_thread(analyze_mission, parent_id)
+            reason = (f"Gap {gap_id} added {metrics['merged_claims']} findings from "
+                      f"{metrics['full_text_sources']} full-text sources ({metrics['primary_sources']} primary)")
+            save_revision(parent_id, run_id, previous, current, reason)
+        status = "resolved" if metrics["resolved"] else "exhausted"
+        message = ("Evidence target reached; parent analysis revised" if metrics["resolved"] else
+                   "Search completed but did not meet 3 full-text / 1 primary-source evidence gate")
+        update_run(run_id, status, message, **metrics)
+    except Exception as exc:
+        update_run(run_id, "failed", str(exc)[:500])
+    finally:
+        _gap_processes.pop(run_id, None)
+
+
 async def _run_pipeline_inner(mission_id: str, topic: str, depth: int):
     """Actual pipeline execution (called within semaphore)."""
     import sys
 
     try:
+        _mission_runtime[mission_id] = {"started_at": time.time(), "last_output_at": time.time(),
+                                        "phase": "starting", "returncode": None}
         _emit_event(mission_id, "start", {"topic": topic, "status": "scout"})
 
         conn = get_db()
@@ -904,17 +1481,21 @@ async def _run_pipeline_inner(mission_id: str, topic: str, depth: int):
         current_phase = "scout"
         async for line in proc.stdout:
             text = line.decode(errors="replace").strip()
+            _mission_runtime[mission_id]["last_output_at"] = time.time()
             # Detect phase transitions
             if "Scout done" in text or "scout.*done" in text.lower():
                 current_phase = "harvest"
+                _mission_runtime[mission_id]["phase"] = current_phase
                 _emit_event(mission_id, "phase", {"phase": "harvest", "event": "started"})
                 _update_phase(mission_id, "harvest")
             elif "Harvest" in text and "done" in text.lower():
                 current_phase = "process"
+                _mission_runtime[mission_id]["phase"] = current_phase
                 _emit_event(mission_id, "phase", {"phase": "process", "event": "started"})
                 _update_phase(mission_id, "process")
             elif "Process" in text and "done" in text.lower():
                 current_phase = "synth"
+                _mission_runtime[mission_id]["phase"] = current_phase
                 _emit_event(mission_id, "phase", {"phase": "synth", "event": "started"})
                 _update_phase(mission_id, "synth")
             # Detect claims progress
@@ -924,18 +1505,28 @@ async def _run_pipeline_inner(mission_id: str, topic: str, depth: int):
                     _emit_event(mission_id, "claims", {"count": int(nums[0]), "phase": current_phase})
 
         await proc.wait()
+        _mission_runtime[mission_id]["returncode"] = proc.returncode
+        _mission_runtime[mission_id]["last_output_at"] = time.time()
 
         # Gather final results
         conn = get_db()
         cur = conn.cursor()
         if proc.returncode == 0:
-            cur.execute("UPDATE hive_missions SET status = 'done', phase = 'done' WHERE id = %s", (mission_id,))
+            cur.execute("SELECT status FROM hive_missions WHERE id=%s", (mission_id,))
+            engine_status = (cur.fetchone() or [None])[0]
             cur.execute(
                 "SELECT COUNT(*), COALESCE(AVG(quality_score), 0) FROM hive_claims WHERE mission_id = %s AND (is_garbage = false OR is_garbage IS NULL)",
                 (mission_id,)
             )
             row = cur.fetchone()
-            _emit_event(mission_id, "done", {"total_claims": row[0] or 0, "avg_quality": round(float(row[1] or 0), 4)})
+            if engine_status == "insufficient":
+                _emit_event(mission_id, "done", {"total_claims": 0, "outcome": "insufficient_evidence"})
+            elif engine_status in ("error", "interrupted", "cancelled") or not row[0]:
+                cur.execute("UPDATE hive_missions SET status='error',phase='error' WHERE id=%s", (mission_id,))
+                _emit_event(mission_id, "error", {"message": "Pipeline ended without usable findings"})
+            else:
+                cur.execute("UPDATE hive_missions SET status='done',phase='done' WHERE id=%s", (mission_id,))
+                _emit_event(mission_id, "done", {"total_claims": row[0] or 0, "avg_quality": round(float(row[1] or 0), 4)})
         else:
             cur.execute("UPDATE hive_missions SET status = 'error', phase = 'error' WHERE id = %s", (mission_id,))
             _emit_event(mission_id, "error", {"message": f"Pipeline exited with code {proc.returncode}"})
@@ -943,6 +1534,8 @@ async def _run_pipeline_inner(mission_id: str, topic: str, depth: int):
         conn.close()
 
     except Exception as e:
+        _mission_runtime.setdefault(mission_id, {})["error"] = str(e)
+        _mission_runtime[mission_id]["last_output_at"] = time.time()
         _emit_event(mission_id, "error", {"message": str(e)})
         try:
             conn = get_db()
