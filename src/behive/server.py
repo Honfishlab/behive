@@ -423,14 +423,14 @@ async def research_status(mission_id: str):
         conn = get_db()
         cur = conn.cursor()
         cur.execute(
-            "SELECT status,phase,topic,EXTRACT(EPOCH FROM NOW()-created_at) "
+            "SELECT status,phase,topic,EXTRACT(EPOCH FROM NOW()-created_at),COALESCE(quality_metrics,'{}'::jsonb) "
             "FROM hive_missions WHERE id = %s", (mission_id,)
         )
         row = cur.fetchone()
         if not row:
             conn.close()
             raise HTTPException(404, f"Mission {mission_id} not found")
-        status, phase, topic, mission_age = row
+        status, phase, topic, mission_age, diagnostics = row
         # Get current claims count
         cur.execute(
             "SELECT COUNT(*), COALESCE(AVG(quality_score), 0) FROM hive_claims WHERE mission_id = %s AND (is_garbage = false OR is_garbage IS NULL)",
@@ -469,7 +469,11 @@ async def research_status(mission_id: str):
         checks.append({"id": "phase", "label": "Phase consistency", "state": phase_state, "detail": phase_detail})
 
         downstream = status in ("process", "falsify", "synth", "graph", "done", "partial")
-        flow_failed = source_count > 0 and claims_count == 0 and (downstream or (not terminal and not runtime and age_seconds > 900))
+        worker_stale = bool(runtime and runtime.get("last_output_at") and time.time() - runtime["last_output_at"] > 600)
+        flow_failed = source_count > 0 and claims_count == 0 and (
+            terminal and status not in ("insufficient",) or worker_stale or
+            (not terminal and not runtime and age_seconds > 900)
+        )
         flow_state = "fail" if flow_failed else "warn" if status == "insufficient" else "pass" if claims_count > 0 else "pending"
         flow_detail = f"{source_count} sources → {content_count} documents → {claims_count} findings"
         checks.append({"id": "flow", "label": "Source-to-finding flow", "state": flow_state, "detail": flow_detail})
@@ -495,6 +499,7 @@ async def research_status(mission_id: str):
             "sources_so_far": source_count,
             "documents_so_far": content_count,
             "avg_quality": round(float(crow[1] or 0), 4),
+            "diagnostics": diagnostics or {},
             "watchdog": {"state": watchdog_state, "mission_age_seconds": age_seconds,
                          "run_age_seconds": run_age_seconds,
                          "silent_seconds": silent_seconds, "checks": checks},
@@ -511,7 +516,10 @@ async def recover_research(mission_id: str):
     try:
         conn = get_db()
         cur = conn.cursor()
-        cur.execute("SELECT topic FROM hive_missions WHERE id=%s", (mission_id,))
+        running_task = _mission_runtime.get(mission_id)
+        if running_task and running_task.get("returncode") is None:
+            raise HTTPException(409, "This mission already has an active worker")
+        cur.execute("SELECT topic,COALESCE(quality_metrics,'{}'::jsonb) FROM hive_missions WHERE id=%s", (mission_id,))
         row = cur.fetchone()
         if not row:
             conn.close()
@@ -528,16 +536,21 @@ async def recover_research(mission_id: str):
         if stage == "done":
             conn.close()
             return {"mission_id": mission_id, "status": "done", "recovery_stage": "none"}
+        previous_metrics = row[1] or {}
+        recovery_attempt = int(previous_metrics.get("recovery_attempt", 0)) + 1
         cur.execute(
             "UPDATE hive_missions SET status=%s,phase=%s,quality_metrics="
-            "COALESCE(quality_metrics,'{}'::jsonb)-'error_message' WHERE id=%s",
-            (stage, stage, mission_id),
+            "(COALESCE(quality_metrics,'{}'::jsonb)-'error_message')||jsonb_build_object("
+            "'recovery_attempt',%s,'recovery_stage',%s,'recovery_started_at',NOW()) WHERE id=%s",
+            (stage, stage, recovery_attempt, stage, mission_id),
         )
         conn.commit()
         conn.close()
         asyncio.create_task(_run_recovery(mission_id, stage))
         return {"mission_id": mission_id, "status": "recovering", "recovery_stage": stage,
-                "checkpoints": {"sources": sources, "content": content, "claims": claims}}
+                "attempt": recovery_attempt,
+                "checkpoints": {"sources": sources, "content": content, "claims": claims},
+                "message": f"Reusing {sources} sources and {content} documents; resuming at {stage}"}
     except HTTPException:
         raise
     except Exception as e:
@@ -1355,8 +1368,17 @@ async def _run_recovery(mission_id: str, stage: str):
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
             env={**os.environ, "BEHIVE_MISSION_ID": mission_id, "PYTHONUNBUFFERED": "1"},
         )
+        output_tail = []
         async for line in proc.stdout:
             _mission_runtime[mission_id]["last_output_at"] = time.time()
+            rendered = line.decode(errors="replace").strip()
+            if rendered:
+                output_tail = (output_tail + [rendered])[-12:]
+            lowered = rendered.lower()
+            for detected in ("harvest", "process", "falsify", "synth", "graph"):
+                if detected in lowered:
+                    _mission_runtime[mission_id]["phase"] = detected
+                    break
         await proc.wait()
         _mission_runtime[mission_id]["returncode"] = proc.returncode
         conn = get_db(); cur = conn.cursor()
@@ -1368,16 +1390,28 @@ async def _run_recovery(mission_id: str, stage: str):
         mission_row = cur.fetchone() or (None, 0)
         engine_status, synthesis_length = mission_row[0], mission_row[1] or 0
         if proc.returncode == 0 and engine_status == "insufficient":
-            pass
+            cur.execute(
+                "UPDATE hive_missions SET quality_metrics=COALESCE(quality_metrics,'{}'::jsonb)||"
+                "jsonb_build_object('recovery_outcome','insufficient_evidence','recovery_completed_at',NOW()) WHERE id=%s",
+                (mission_id,),
+            )
         elif proc.returncode == 0 and content > 0 and claims > 0:
             final_status = "done" if synthesis_length >= 100 else "partial"
             cur.execute("UPDATE hive_missions SET status=%s,phase=%s WHERE id=%s",
                         (final_status, final_status, mission_id))
-        else:
             cur.execute(
-                "UPDATE hive_missions SET status='error',phase='error',quality_metrics="
-                "COALESCE(quality_metrics,'{}'::jsonb)||jsonb_build_object('error_message',%s) WHERE id=%s",
-                (f"Recovery from {stage} failed: exit={proc.returncode}, content={content}, claims={claims}", mission_id),
+                "UPDATE hive_missions SET quality_metrics=COALESCE(quality_metrics,'{}'::jsonb)||"
+                "jsonb_build_object('recovery_outcome',%s,'recovery_completed_at',NOW()) WHERE id=%s",
+                (final_status, mission_id),
+            )
+        else:
+            detail = " | ".join(output_tail)[-1200:]
+            cur.execute(
+                "UPDATE hive_missions SET status='error',phase=%s,quality_metrics="
+                "COALESCE(quality_metrics,'{}'::jsonb)||jsonb_build_object("
+                "'failure_stage',%s,'error_message',%s,'error_detail',%s,'recoverable',TRUE) WHERE id=%s",
+                (stage, stage, f"Recovery from {stage} failed: exit={proc.returncode}, content={content}, claims={claims}",
+                 detail, mission_id),
             )
         conn.commit(); conn.close()
     except Exception as exc:
@@ -1479,8 +1513,11 @@ async def _run_pipeline_inner(mission_id: str, topic: str, depth: int):
 
         # Parse subprocess output for phase transitions and progress
         current_phase = "scout"
+        output_tail = []
         async for line in proc.stdout:
             text = line.decode(errors="replace").strip()
+            if text:
+                output_tail = (output_tail + [text])[-12:]
             _mission_runtime[mission_id]["last_output_at"] = time.time()
             # Detect phase transitions
             if "Scout done" in text or "scout.*done" in text.lower():
@@ -1528,8 +1565,17 @@ async def _run_pipeline_inner(mission_id: str, topic: str, depth: int):
                 cur.execute("UPDATE hive_missions SET status='done',phase='done' WHERE id=%s", (mission_id,))
                 _emit_event(mission_id, "done", {"total_claims": row[0] or 0, "avg_quality": round(float(row[1] or 0), 4)})
         else:
-            cur.execute("UPDATE hive_missions SET status = 'error', phase = 'error' WHERE id = %s", (mission_id,))
-            _emit_event(mission_id, "error", {"message": f"Pipeline exited with code {proc.returncode}"})
+            detail = " | ".join(output_tail)[-1200:]
+            message = f"{current_phase.title()} worker exited with code {proc.returncode}"
+            cur.execute(
+                "UPDATE hive_missions SET status='error',phase=%s,quality_metrics="
+                "COALESCE(quality_metrics,'{}'::jsonb)||jsonb_build_object("
+                "'failure_stage',%s,'error_message',%s,'worker_exit_code',%s,'error_detail',%s,"
+                "'recoverable',TRUE,'failed_at',NOW()) WHERE id=%s",
+                (current_phase, current_phase, message, proc.returncode, detail, mission_id),
+            )
+            _emit_event(mission_id, "error", {"message": message, "stage": current_phase,
+                                                 "recoverable": True, "detail": detail})
         conn.commit()
         conn.close()
 
@@ -1540,7 +1586,13 @@ async def _run_pipeline_inner(mission_id: str, topic: str, depth: int):
         try:
             conn = get_db()
             cur = conn.cursor()
-            cur.execute("UPDATE hive_missions SET status = 'error', phase = 'error' WHERE id = %s", (mission_id,))
+            failure_stage = _mission_runtime.get(mission_id, {}).get("phase", "starting")
+            cur.execute(
+                "UPDATE hive_missions SET status='error',phase=%s,quality_metrics="
+                "COALESCE(quality_metrics,'{}'::jsonb)||jsonb_build_object("
+                "'failure_stage',%s,'error_message',%s,'recoverable',TRUE,'failed_at',NOW()) WHERE id=%s",
+                (failure_stage, failure_stage, str(e)[:1000], mission_id),
+            )
             conn.commit()
             conn.close()
         except Exception:

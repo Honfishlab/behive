@@ -1849,7 +1849,30 @@ def _run_pipeline_phases(mission_id: str, topic: str, plan: list, timings: dict,
     except Exception:
         _claims_after_process = 0
     if _claims_after_process == 0:
-        raise RuntimeError(f"Process produced 0 findings from {_n_harvested} harvested documents")
+        log.warning("Primary processor produced no findings; running evidence-linked fallback extraction")
+        _emit(mission_id, 'process', 'fallback_started', data={
+            'documents': _n_harvested,
+            'strategy': 'authority_gated_extraction',
+        })
+        try:
+            _claims_after_process = _fallback_extract_claims(mission_id)
+        except Exception as _fallback_error:
+            log.warning(f"Fallback extraction failed without discarding checkpoints: {_fallback_error}")
+            _emit(mission_id, 'process', 'fallback_error', data={'error': str(_fallback_error)})
+            _claims_after_process = 0
+        if _claims_after_process:
+            log.info(f"Fallback extraction recovered {_claims_after_process} evidence-linked findings")
+            _emit(mission_id, 'process', 'fallback_completed', data={'claims': _claims_after_process})
+        else:
+            log.warning("No defensible findings after both extraction strategies; recording insufficient evidence")
+            outcome = _record_insufficient_evidence(mission_id, _n_harvested)
+            _emit(mission_id, 'process', 'insufficient_evidence', data=outcome)
+            try:
+                from behive.engine.frontier import run_frontier_cycle
+                run_frontier_cycle(mission_id, trigger="insufficient_evidence")
+            except Exception as discovery_error:
+                log.warning(f"Discovery mapping failed without invalidating evidence state: {discovery_error}")
+            return
     log.info(f'  └─ done · {timings["process"]:.1f}s ──────────────────────────────┘\n')
 
     # ═══ PHASE 3.5: FALSIFIER (claim dedup + cross-validation) ══
