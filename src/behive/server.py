@@ -156,7 +156,7 @@ async def _continuous_discovery_loop():
                 task = _frontier_tasks.get(mission_id)
                 if not task or task.done():
                     _frontier_tasks[mission_id] = asyncio.create_task(
-                        _run_frontier_background(mission_id, "continuous_cadence"))
+                        _run_controller_background(mission_id, "continuous_cadence"))
         except Exception as exc:
             print(f"Continuous discovery scheduler warning: {exc}")
         await asyncio.sleep(300)
@@ -739,6 +739,19 @@ async def _run_frontier_background(mission_id: str, trigger: str):
         _frontier_tasks.pop(mission_id, None)
 
 
+async def _run_controller_background(mission_id: str, trigger: str):
+    """Run one ranked continuous-research action and publish its outcome."""
+    try:
+        from behive.engine.controller import run_next_action
+        _emit_event(mission_id, "controller", {"state": "ranking", "message": "Ranking branch actions by information gain"})
+        result = await asyncio.to_thread(run_next_action, mission_id, trigger)
+        _emit_event(mission_id, "controller", {"state": result.get("status", "complete"), **result})
+    except Exception as exc:
+        _emit_event(mission_id, "controller", {"state": "retrying", "message": str(exc), "recoverable": True})
+    finally:
+        _frontier_tasks.pop(mission_id, None)
+
+
 @app.get("/research/{mission_id}/discovery")
 async def get_discovery(mission_id: str):
     """Return the open-world evidence graph, unknowns, and hypothesis portfolio."""
@@ -765,6 +778,31 @@ async def start_discovery_cycle(mission_id: str):
         raise HTTPException(404, f"Mission {mission_id} not found")
     _frontier_tasks[mission_id] = asyncio.create_task(_run_frontier_background(mission_id, "user_or_autonomous_cycle"))
     return {"mission_id": mission_id, "status": "queued", "mode": "open_world_discovery"}
+
+
+@app.get("/research/{mission_id}/controller")
+async def continuous_controller_state(mission_id: str):
+    """Return branch memory, ranked action queue, and the durable change ledger."""
+    try:
+        from behive.engine.controller import get_controller_state
+        return await asyncio.to_thread(get_controller_state, mission_id)
+    except Exception as exc:
+        raise HTTPException(500, str(exc))
+
+
+@app.post("/research/{mission_id}/controller/cycles")
+async def run_continuous_controller(mission_id: str):
+    """Run the highest-value available branch action now."""
+    task = _frontier_tasks.get(mission_id)
+    if task and not task.done():
+        raise HTTPException(409, "A discovery or controller cycle is already active")
+    conn = get_db(); cur = conn.cursor()
+    cur.execute("SELECT 1 FROM hive_missions WHERE id=%s", (mission_id,))
+    exists = cur.fetchone(); conn.close()
+    if not exists:
+        raise HTTPException(404, f"Mission {mission_id} not found")
+    _frontier_tasks[mission_id] = asyncio.create_task(_run_controller_background(mission_id, "user_controller_cycle"))
+    return {"mission_id": mission_id, "status": "queued", "mode": "continuous_controller"}
 
 
 @app.patch("/research/{mission_id}/frontiers/{frontier_id}")
