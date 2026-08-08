@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from hashlib import sha1
 
 from behive.engine.db import connect
@@ -316,6 +316,29 @@ def get_controller_state(mission_id: str) -> dict:
         "SELECT MIN(queued_at) FROM hive_research_actions WHERE mission_id=? AND status IN ('queued','retrying')",
         [mission_id],
     ).fetchone()[0]
+    elapsed_row = db.execute(
+        "SELECT EXTRACT(EPOCH FROM (NOW()-MAX(completed_at))) FROM hive_research_actions "
+        "WHERE mission_id=? AND status='complete'", [mission_id]
+    ).fetchone()
+    elapsed = float(elapsed_row[0]) if elapsed_row and elapsed_row[0] is not None else None
+    cooldown_seconds = max(0, int(300-elapsed)) if elapsed is not None else 0
+    policy_row = db.execute(
+        "SELECT p.agent_policy FROM hive_projects p JOIN hive_missions m "
+        "ON LOWER(TRIM(m.topic))=LOWER(TRIM(p.root_question)) WHERE m.id=? LIMIT 1", [mission_id]
+    ).fetchone()
+    policy = policy_row[0] if policy_row and policy_row[0] else {}
+    running_count = status_counts.get("running", 0)
+    pending_count = status_counts.get("queued",0)+status_counts.get("retrying",0)
+    if policy.get("autonomy") != "continuous" or policy.get("status") != "running":
+        continuous_state = "paused"
+    elif running_count:
+        continuous_state = "running"
+    elif pending_count and cooldown_seconds:
+        continuous_state = "cooldown"
+    elif pending_count:
+        continuous_state = "ready"
+    else:
+        continuous_state = "monitoring"
     db.close()
     return {
         "mission_id": mission_id,
@@ -329,8 +352,11 @@ def get_controller_state(mission_id: str) -> dict:
                      "started_at":r[15],"completed_at":r[16]} for r in actions],
         "changes": [{"id":r[0],"branch_id":r[1],"type":r[2],"headline":r[3],"detail":r[4],"before":r[5],
                      "after":r[6],"importance":r[7],"created_at":r[8]} for r in changes],
-        "metrics": {"statuses": status_counts, "pending": status_counts.get("queued",0)+status_counts.get("retrying",0),
+        "metrics": {"statuses": status_counts, "pending": pending_count,
                     "completed": status_counts.get("complete",0), "failed": status_counts.get("failed",0),
                     "superseded": status_counts.get("superseded",0), "oldest_pending_at": oldest_pending,
-                    "queue_limit": MAX_PENDING_ACTIONS},
+                    "queue_limit": MAX_PENDING_ACTIONS, "continuous_state": continuous_state,
+                    "cooldown_seconds": cooldown_seconds,
+                    "next_eligible_at": datetime.now()+timedelta(seconds=cooldown_seconds) if cooldown_seconds else None,
+                    "policy": policy},
     }
