@@ -142,12 +142,23 @@ async def _continuous_discovery_loop():
             cur.execute("""
                 SELECT DISTINCT ON (p.id) m.id,p.cadence_minutes
                 FROM hive_projects p JOIN hive_missions m ON LOWER(TRIM(m.topic))=LOWER(TRIM(p.root_question))
-                LEFT JOIN hive_discovery_cycles dc ON dc.mission_id=m.id
                 WHERE COALESCE(p.agent_policy->>'autonomy','assisted')='continuous'
+                  AND COALESCE(p.agent_policy->>'status','paused')='running'
                   AND m.status IN ('done','insufficient')
-                GROUP BY p.id,m.id,p.cadence_minutes,m.created_at
-                HAVING MAX(dc.completed_at) IS NULL OR
-                       MAX(dc.completed_at) < NOW()-(GREATEST(15,p.cadence_minutes)||' minutes')::interval
+                  AND NOT EXISTS (
+                    SELECT 1 FROM hive_research_actions active
+                    WHERE active.mission_id=m.id AND active.status='running')
+                  AND (
+                    (EXISTS (
+                       SELECT 1 FROM hive_research_actions queued
+                       WHERE queued.mission_id=m.id AND queued.status IN ('queued','retrying')
+                         AND (queued.next_attempt_at IS NULL OR queued.next_attempt_at<=NOW()))
+                     AND COALESCE((SELECT MAX(done.completed_at) FROM hive_research_actions done
+                                   WHERE done.mission_id=m.id),TIMESTAMP '1970-01-01') < NOW()-INTERVAL '5 minutes')
+                    OR COALESCE((SELECT MAX(dc.completed_at) FROM hive_discovery_cycles dc
+                                 WHERE dc.mission_id=m.id),TIMESTAMP '1970-01-01')
+                       < NOW()-(GREATEST(15,p.cadence_minutes)||' minutes')::interval
+                  )
                 ORDER BY p.id,m.created_at DESC
                 LIMIT 2
             """)
