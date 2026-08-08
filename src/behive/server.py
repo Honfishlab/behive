@@ -326,6 +326,12 @@ class CopilotActionRequest(BaseModel):
     parent_id: str | None = None
 
 
+class BoundaryResearchRequest(BaseModel):
+    section_key: str = Field(..., min_length=1, max_length=200)
+    title: str = Field(..., min_length=3, max_length=1000)
+    boundary: str = Field(..., min_length=12, max_length=5000)
+
+
 # ─── Entity Extraction (lightweight NLP) ─────────────────────────────────────
 
 _ENTITY_PATTERN = re.compile(
@@ -754,6 +760,63 @@ async def get_living_research_summary(mission_id: str, refresh: bool = False):
         raise HTTPException(404, str(exc))
     except Exception as exc:
         raise HTTPException(500, f"Living summary failed: {exc}")
+
+
+_boundary_tasks: dict[str, asyncio.Task] = {}
+
+
+async def _run_boundary_program(program_id: str):
+    try:
+        from behive.engine.boundary_research import run_program
+        await asyncio.to_thread(run_program, program_id)
+    except Exception as exc:
+        print(f"Boundary research {program_id} failed: {exc}")
+    finally:
+        _boundary_tasks.pop(program_id, None)
+
+
+@app.get("/research/{mission_id}/boundaries")
+async def list_boundary_research(mission_id: str):
+    try:
+        from behive.engine.boundary_research import get_programs
+        programs = await asyncio.to_thread(get_programs, mission_id)
+        for item in programs:
+            task = _boundary_tasks.get(item["id"])
+            item["active"] = bool(task and not task.done())
+        return {"mission_id": mission_id, "programs": programs}
+    except Exception as exc:
+        raise HTTPException(500, str(exc))
+
+
+@app.post("/research/{mission_id}/boundaries")
+async def deepen_evidence_boundary(mission_id: str, body: BoundaryResearchRequest):
+    try:
+        from behive.engine.boundary_research import create_program
+        program = await asyncio.to_thread(create_program, mission_id, body.section_key, body.title, body.boundary)
+        task = _boundary_tasks.get(program["id"])
+        if task and not task.done():
+            raise HTTPException(409, "This evidence boundary is already being researched")
+        _boundary_tasks[program["id"]] = asyncio.create_task(_run_boundary_program(program["id"]))
+        return program
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(404, str(exc))
+    except Exception as exc:
+        raise HTTPException(500, str(exc))
+
+
+@app.post("/research/{mission_id}/boundaries/{program_id}/rerun")
+async def rerun_evidence_boundary(mission_id: str, program_id: str):
+    from behive.engine.boundary_research import get_programs
+    programs = await asyncio.to_thread(get_programs, mission_id)
+    if not any(x["id"] == program_id for x in programs):
+        raise HTTPException(404, "Evidence boundary program not found")
+    task = _boundary_tasks.get(program_id)
+    if task and not task.done():
+        raise HTTPException(409, "Evidence boundary research is already active")
+    _boundary_tasks[program_id] = asyncio.create_task(_run_boundary_program(program_id))
+    return {"id": program_id, "status": "queued"}
 
 
 _frontier_tasks: dict[str, asyncio.Task] = {}
