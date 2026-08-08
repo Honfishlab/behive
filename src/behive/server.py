@@ -302,6 +302,19 @@ class GapUpdate(BaseModel):
     question: str = Field(..., min_length=8, max_length=1000)
 
 
+class CopilotChatRequest(BaseModel):
+    message: str = Field(..., min_length=2, max_length=8000)
+    thread_id: str | None = None
+    scope: str = Field(default="mission", pattern="^(point|branch|mission|all)$")
+    external: bool = False
+
+
+class CopilotActionRequest(BaseModel):
+    action_type: str = Field(..., pattern="^(add_question|start_controller|external_search)$")
+    question: str | None = Field(default=None, max_length=2000)
+    parent_id: str | None = None
+
+
 # ─── Entity Extraction (lightweight NLP) ─────────────────────────────────────
 
 _ENTITY_PATTERN = re.compile(
@@ -803,6 +816,80 @@ async def run_continuous_controller(mission_id: str):
         raise HTTPException(404, f"Mission {mission_id} not found")
     _frontier_tasks[mission_id] = asyncio.create_task(_run_controller_background(mission_id, "user_controller_cycle"))
     return {"mission_id": mission_id, "status": "queued", "mode": "continuous_controller"}
+
+
+@app.post("/research/{mission_id}/copilot/chat")
+async def research_copilot_chat(mission_id: str, body: CopilotChatRequest):
+    """Converse with a mission-aware copilot grounded in BeHive's evidence graph."""
+    try:
+        from behive.engine.copilot import chat
+        return await asyncio.to_thread(chat, mission_id, body.message, body.thread_id, body.scope, body.external)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc))
+    except Exception as exc:
+        raise HTTPException(500, f"Copilot failed: {exc}")
+
+
+@app.get("/research/{mission_id}/copilot/threads")
+async def research_copilot_threads(mission_id: str):
+    from behive.engine.copilot import history
+    try:
+        return {"mission_id": mission_id, "threads": await asyncio.to_thread(history, mission_id)}
+    except Exception as exc:
+        raise HTTPException(500, str(exc))
+
+
+@app.get("/research/{mission_id}/copilot/threads/{thread_id}")
+async def research_copilot_messages(mission_id: str, thread_id: str):
+    from behive.engine.copilot import messages
+    try:
+        return {"mission_id": mission_id, "thread_id": thread_id,
+                "messages": await asyncio.to_thread(messages, mission_id, thread_id)}
+    except ValueError as exc:
+        raise HTTPException(404, str(exc))
+    except Exception as exc:
+        raise HTTPException(500, str(exc))
+
+
+@app.post("/research/{mission_id}/copilot/actions")
+async def research_copilot_action(mission_id: str, body: CopilotActionRequest):
+    """Execute only a user-confirmed copilot proposal."""
+    conn = get_db(); cur = conn.cursor()
+    cur.execute("SELECT topic FROM hive_missions WHERE id=%s", (mission_id,))
+    mission = cur.fetchone()
+    if not mission:
+        conn.close(); raise HTTPException(404, "Mission not found")
+    if body.action_type == "start_controller":
+        conn.close()
+        task = _frontier_tasks.get(mission_id)
+        if task and not task.done():
+            raise HTTPException(409, "A discovery or controller cycle is already active")
+        _frontier_tasks[mission_id] = asyncio.create_task(_run_controller_background(mission_id, "copilot_confirmed"))
+        return {"status": "queued", "action": "start_controller"}
+    if not body.question or len(body.question.strip()) < 8:
+        conn.close(); raise HTTPException(422, "This action requires a question of at least 8 characters")
+    if body.action_type == "external_search":
+        conn.close()
+        from behive.engine.authority import ingest_authority_sources
+        result = await asyncio.to_thread(ingest_authority_sources, mission_id, body.question.strip(), 8)
+        return {"status": "complete", "action": "external_search", "result": result}
+    cur.execute("SELECT id FROM hive_projects WHERE LOWER(TRIM(root_question))=LOWER(TRIM(%s)) LIMIT 1", (mission[0],))
+    project = cur.fetchone()
+    if not project:
+        conn.close(); raise HTTPException(409, "No question tree is linked to this mission")
+    depth = 1
+    parent_id = body.parent_id
+    if parent_id:
+        cur.execute("SELECT depth FROM hive_questions WHERE id=%s AND project_id=%s", (parent_id, project[0]))
+        parent = cur.fetchone()
+        if not parent:
+            conn.close(); raise HTTPException(400, "Parent question is not in this mission")
+        depth = parent[0] + 1
+    question_id = "question_" + hashlib.sha256(f"{project[0]}:{body.question}:{time.time_ns()}".encode()).hexdigest()[:16]
+    cur.execute("INSERT INTO hive_questions (id,project_id,parent_id,question,depth,kind,priority,status) VALUES (%s,%s,%s,%s,%s,'copilot',0.75,'open')",
+                (question_id, project[0], parent_id, body.question.strip(), depth))
+    conn.commit(); conn.close()
+    return {"status": "complete", "action": "add_question", "question_id": question_id, "depth": depth}
 
 
 @app.patch("/research/{mission_id}/frontiers/{frontier_id}")
