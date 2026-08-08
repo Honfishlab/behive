@@ -9,11 +9,15 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime
 from hashlib import sha1
 
 from behive.engine.db import connect
 
 log = logging.getLogger(__name__)
+MAX_ACTIVE_BRANCHES = 40
+MAX_PENDING_ACTIONS = 40
+MIN_OLDEST_ACTIONS = 15
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS hive_research_branches (
@@ -141,6 +145,25 @@ def _choose_action(branch: tuple) -> tuple[str, str, dict]:
     return kind, rationale, metrics
 
 
+def compact_pending_queue(db, mission_id: str) -> dict:
+    """Bound pending work while retaining the oldest work and highest-value newer work."""
+    rows = db.execute(
+        "SELECT id,score,queued_at FROM hive_research_actions WHERE mission_id=? "
+        "AND status IN ('queued','retrying') ORDER BY queued_at,id", [mission_id]
+    ).fetchall()
+    if len(rows) <= MAX_PENDING_ACTIONS:
+        return {"pending_before": len(rows), "superseded": 0, "pending_after": len(rows)}
+    now = datetime.now()
+    oldest = [r[0] for r in rows[:MIN_OLDEST_ACTIONS]]
+    # Age raises effective priority by up to .5, preventing indefinite starvation.
+    ranked = sorted(rows, key=lambda r: float(r[1] or 0) + min(.5, max(0, (now-r[2]).total_seconds())/3600*.03), reverse=True)
+    keep = list(dict.fromkeys(oldest + [r[0] for r in ranked]))[:MAX_PENDING_ACTIONS]
+    discard = [r[0] for r in rows if r[0] not in set(keep)]
+    if discard:
+        db.execute("UPDATE hive_research_actions SET status='superseded',error_message='Queue compacted: lower value than retained pending work' WHERE id=ANY(?)", [discard])
+    return {"pending_before": len(rows), "superseded": len(discard), "pending_after": len(keep)}
+
+
 def reconcile(mission_id: str, trigger: str = "controller") -> dict:
     """Synchronize branches, record graph changes, and queue ranked actions."""
     db = connect(); ensure_schema(db)
@@ -160,14 +183,17 @@ def reconcile(mission_id: str, trigger: str = "controller") -> dict:
     generation = db.execute(
         "SELECT COALESCE(MAX(id),0)+1 FROM hive_research_changes WHERE mission_id=?", [mission_id]
     ).fetchone()[0]
+    queue = compact_pending_queue(db, mission_id)
     branches = db.execute(
         "SELECT id,subject_id,title,status,reason,uncertainty,evidence_coverage,priority,retry_count,"
         "duplicate_streak,no_progress_cycles FROM hive_research_branches WHERE mission_id=? "
         "AND status IN ('watching','searching','retrieving','extracting','verifying','hypothesis_testing','blocked') "
-        "ORDER BY priority DESC", [mission_id]
+        "ORDER BY priority DESC,created_at LIMIT ?", [mission_id, MAX_ACTIVE_BRANCHES]
     ).fetchall()
     queued = 0
     for branch in branches:
+        if queue["pending_after"] + queued >= MAX_PENDING_ACTIONS:
+            break
         bid, _, title, status, _, uncertainty, coverage, priority, retries, duplicates, stagnant = branch
         if stagnant >= 3 or duplicates >= 3:
             next_state = "exhausted" if stagnant >= 5 else "scheduled_revisit"
@@ -198,7 +224,7 @@ def reconcile(mission_id: str, trigger: str = "controller") -> dict:
         )
         queued += 1
     db.commit(); db.close()
-    return {"mission_id": mission_id, "branches_synced": synced, "actions_queued": queued,
+    return {"mission_id": mission_id, "branches_synced": synced, "actions_queued": queued, "queue": queue,
             "before": before, "after": after}
 
 
@@ -211,7 +237,8 @@ def run_next_action(mission_id: str, trigger: str = "continuous") -> dict:
            FROM hive_research_actions a
            WHERE a.mission_id=? AND a.status IN ('queued','retrying')
              AND (a.next_attempt_at IS NULL OR a.next_attempt_at<=NOW())
-           ORDER BY a.score DESC,a.queued_at LIMIT 1 FOR UPDATE SKIP LOCKED""", [mission_id]
+           ORDER BY (a.score + LEAST(.5,EXTRACT(EPOCH FROM (NOW()-a.queued_at))/3600*.03)) DESC,
+                    a.queued_at LIMIT 1 FOR UPDATE SKIP LOCKED""", [mission_id]
     ).fetchone()
     if not row:
         db.close(); return {**reconcile_result, "status": "idle", "reason": "No actionable branch"}
@@ -237,9 +264,11 @@ def run_next_action(mission_id: str, trigger: str = "continuous") -> dict:
         progress = sum(max(0, after[k]-before.get(k, 0)) for k in after)
         db.execute("UPDATE hive_research_actions SET status='complete',result=?::jsonb,completed_at=NOW() WHERE id=?",
                    [json.dumps(result), action_id])
-        db.execute("UPDATE hive_research_branches SET status='watching',no_progress_cycles=?,duplicate_streak=?,"
+        db.execute("UPDATE hive_research_branches SET status='watching',"
+                   "no_progress_cycles=CASE WHEN ? THEN 0 ELSE no_progress_cycles+1 END,"
+                   "duplicate_streak=CASE WHEN ? THEN 0 ELSE duplicate_streak+1 END,"
                    "retry_count=0,updated_at=NOW() WHERE id=?",
-                   [0 if progress else 1, 0 if progress else 1, branch_id])
+                   [bool(progress), bool(progress), branch_id])
         _record_change(db, mission_id, "action_complete", f"{action_type.replace('_',' ').title()}: {title}",
                        f"{progress} new graph objects; {rationale}", before, after, .75 if progress else .4, branch_id)
         db.commit(); db.close()
@@ -261,7 +290,8 @@ def run_next_action(mission_id: str, trigger: str = "continuous") -> dict:
 
 
 def get_controller_state(mission_id: str) -> dict:
-    ensure_schema(); reconcile(mission_id, "dashboard")
+    # Dashboard reads must never create branches or queue actions.
+    ensure_schema()
     db = connect()
     branches = db.execute(
         "SELECT id,subject_type,subject_id,title,status,reason,uncertainty,evidence_coverage,priority,retry_count,"
@@ -277,7 +307,16 @@ def get_controller_state(mission_id: str) -> dict:
     changes = db.execute(
         "SELECT id,branch_id,change_type,headline,detail,before_state,after_state,importance,created_at "
         "FROM hive_research_changes WHERE mission_id=? ORDER BY created_at DESC LIMIT 100", [mission_id]
-    ).fetchall(); db.close()
+    ).fetchall()
+    status_rows = db.execute(
+        "SELECT status,COUNT(*) FROM hive_research_actions WHERE mission_id=? GROUP BY status", [mission_id]
+    ).fetchall()
+    status_counts = {r[0]: r[1] for r in status_rows}
+    oldest_pending = db.execute(
+        "SELECT MIN(queued_at) FROM hive_research_actions WHERE mission_id=? AND status IN ('queued','retrying')",
+        [mission_id],
+    ).fetchone()[0]
+    db.close()
     return {
         "mission_id": mission_id,
         "branches": [{"id":r[0],"subject_type":r[1],"subject_id":r[2],"title":r[3],"status":r[4],"reason":r[5],
@@ -290,4 +329,8 @@ def get_controller_state(mission_id: str) -> dict:
                      "started_at":r[15],"completed_at":r[16]} for r in actions],
         "changes": [{"id":r[0],"branch_id":r[1],"type":r[2],"headline":r[3],"detail":r[4],"before":r[5],
                      "after":r[6],"importance":r[7],"created_at":r[8]} for r in changes],
+        "metrics": {"statuses": status_counts, "pending": status_counts.get("queued",0)+status_counts.get("retrying",0),
+                    "completed": status_counts.get("complete",0), "failed": status_counts.get("failed",0),
+                    "superseded": status_counts.get("superseded",0), "oldest_pending_at": oldest_pending,
+                    "queue_limit": MAX_PENDING_ACTIONS},
     }
