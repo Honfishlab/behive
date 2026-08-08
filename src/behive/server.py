@@ -733,6 +733,18 @@ async def get_research_evidence(mission_id: str):
         raise HTTPException(500, str(e))
 
 
+@app.get("/research/{mission_id}/summary")
+async def get_living_research_summary(mission_id: str, refresh: bool = False):
+    """Return a five-section living summary, regenerated whenever questions or findings change."""
+    try:
+        from behive.engine.living_summary import get_living_summary
+        return await asyncio.to_thread(get_living_summary, mission_id, refresh)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc))
+    except Exception as exc:
+        raise HTTPException(500, f"Living summary failed: {exc}")
+
+
 _frontier_tasks: dict[str, asyncio.Task] = {}
 
 
