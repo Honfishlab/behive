@@ -821,6 +821,45 @@ async def review_claim(mission_id: str, claim_id: int, body: ClaimReviewAction):
         raise HTTPException(404, str(exc))
 
 
+_citation_audit_tasks: dict[str, asyncio.Task] = {}
+_citation_audit_results: dict[str, dict] = {}
+
+
+async def _run_citation_audit(mission_id: str):
+    try:
+        from behive.engine.citation_auditor import audit_mission
+        _citation_audit_results[mission_id] = await asyncio.to_thread(audit_mission, mission_id, 100)
+    except Exception as exc:
+        _citation_audit_results[mission_id] = {'mission_id':mission_id,'status':'error','error':str(exc)}
+    finally:
+        _citation_audit_tasks.pop(mission_id, None)
+
+
+@app.post("/research/{mission_id}/citation-audits")
+async def start_citation_audit(mission_id: str):
+    task=_citation_audit_tasks.get(mission_id)
+    if task and not task.done(): return {'mission_id':mission_id,'status':'running'}
+    _citation_audit_results.pop(mission_id,None)
+    _citation_audit_tasks[mission_id]=asyncio.create_task(_run_citation_audit(mission_id))
+    return {'mission_id':mission_id,'status':'queued'}
+
+
+@app.get("/research/{mission_id}/citation-audits")
+async def citation_audit_status(mission_id: str):
+    task=_citation_audit_tasks.get(mission_id)
+    if task and not task.done(): return {'mission_id':mission_id,'status':'running'}
+    return _citation_audit_results.get(mission_id,{'mission_id':mission_id,'status':'idle'})
+
+
+@app.post("/research/{mission_id}/citation-audits/{claim_id}")
+async def audit_single_citation(mission_id: str, claim_id: int):
+    try:
+        from behive.engine.citation_auditor import audit_claim
+        return await asyncio.to_thread(audit_claim, mission_id, claim_id)
+    except ValueError as exc:
+        raise HTTPException(404,str(exc))
+
+
 @app.post("/research/{mission_id}/boundaries")
 async def deepen_evidence_boundary(mission_id: str, body: BoundaryResearchRequest):
     try:

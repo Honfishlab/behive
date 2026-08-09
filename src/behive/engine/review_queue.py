@@ -10,6 +10,9 @@ CREATE TABLE IF NOT EXISTS hive_claim_reviews (
  created_at TIMESTAMP DEFAULT NOW(), updated_at TIMESTAMP DEFAULT NOW(),
  UNIQUE(mission_id,claim_id));
 CREATE INDEX IF NOT EXISTS idx_claim_reviews_mission ON hive_claim_reviews(mission_id,decision,updated_at DESC);
+ALTER TABLE hive_claims ADD COLUMN IF NOT EXISTS integrity_status VARCHAR DEFAULT 'unaudited';
+ALTER TABLE hive_claims ADD COLUMN IF NOT EXISTS integrity_score DOUBLE PRECISION DEFAULT 0;
+ALTER TABLE hive_claims ADD COLUMN IF NOT EXISTS integrity_details JSONB DEFAULT '{}'::jsonb;
 """
 def ensure_schema(db=None):
     owned=db is None; db=db or connect()
@@ -18,8 +21,8 @@ def ensure_schema(db=None):
 
 def list_reviews(mission_id: str) -> dict:
     db=connect(); ensure_schema(db)
-    rows=db.execute("SELECT c.id,c.claim,c.evidence,c.source_url,c.claim_type,c.confidence,c.quality_score,c.verified,c.source_tier,c.quality_details,r.decision,r.note,r.updated_at FROM hive_claims c LEFT JOIN hive_claim_reviews r ON r.mission_id=c.mission_id AND r.claim_id=c.id WHERE c.mission_id=? AND (c.is_garbage=FALSE OR c.is_garbage IS NULL) ORDER BY CASE WHEN r.decision IS NULL THEN 0 WHEN r.decision='needs_more' THEN 1 ELSE 2 END,c.quality_score DESC,c.id DESC LIMIT 500",[mission_id]).fetchall(); db.close()
-    items=[{'id':r[0],'claim':r[1],'evidence':r[2] or '','source_url':r[3] or '','claim_type':r[4] or 'finding','confidence':r[5] or 0,'quality':r[6] or 0,'verified':bool(r[7]),'source_tier':r[8],'quality_details':r[9] or {},'decision':r[10] or 'pending','note':r[11] or '','reviewed_at':r[12]} for r in rows]
+    rows=db.execute("SELECT c.id,c.claim,c.evidence,c.source_url,c.claim_type,c.confidence,c.quality_score,c.verified,c.source_tier,c.quality_details,r.decision,r.note,r.updated_at,COALESCE(c.integrity_status,'unaudited'),COALESCE(c.integrity_score,0),COALESCE(c.integrity_details,'{}'::jsonb),COALESCE(c.is_garbage,FALSE) FROM hive_claims c LEFT JOIN hive_claim_reviews r ON r.mission_id=c.mission_id AND r.claim_id=c.id WHERE c.mission_id=? ORDER BY CASE WHEN r.decision IS NULL THEN 0 WHEN r.decision='needs_more' THEN 1 ELSE 2 END,c.quality_score DESC,c.id DESC LIMIT 500",[mission_id]).fetchall(); db.close()
+    items=[{'id':r[0],'claim':r[1],'evidence':r[2] or '','source_url':r[3] or '','claim_type':r[4] or 'finding','confidence':r[5] or 0,'quality':r[6] or 0,'verified':bool(r[7]),'source_tier':r[8],'quality_details':r[9] or {},'decision':r[10] or 'pending','note':r[11] or '','reviewed_at':r[12],'integrity_status':r[13],'integrity_score':r[14],'integrity_details':r[15] or {},'quarantined':bool(r[16])} for r in rows]
     return {'mission_id':mission_id,'items':items,'metrics':{'total':len(items),'pending':sum(x['decision']=='pending' for x in items),'approved':sum(x['decision']=='approved' for x in items),'rejected':sum(x['decision']=='rejected' for x in items),'needs_more':sum(x['decision']=='needs_more' for x in items)}}
 
 def decide(mission_id: str, claim_id: int, decision: str, note: str='') -> dict:
