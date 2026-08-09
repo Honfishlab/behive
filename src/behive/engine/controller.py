@@ -202,6 +202,12 @@ def reconcile(mission_id: str, trigger: str = "controller") -> dict:
             _record_change(db, mission_id, "branch_paused", f"Paused: {title}",
                            "Diminishing returns threshold reached; scheduled for later review.",
                            {"status": status}, {"status": next_state}, .65, bid)
+            from behive.engine.decision_ledger import record
+            record(mission_id,"branch_disposition",f"Branch {next_state.replace('_',' ')}: {title}",
+                   "Diminishing returns threshold reached after repeated duplicate or no-progress cycles.",
+                   subject_key=bid,impact="stops",before={"status":status,"no_progress_cycles":stagnant,"duplicate_streak":duplicates},
+                   after={"status":next_state,"next_review":"7 days"},
+                   reversal_conditions="Resume early if a new authoritative source, contradiction, or materially different measurement becomes available.")
             continue
         active = db.execute(
             "SELECT 1 FROM hive_research_actions WHERE branch_id=? AND status IN ('queued','running','retrying') LIMIT 1",
@@ -271,6 +277,11 @@ def run_next_action(mission_id: str, trigger: str = "continuous") -> dict:
                    [bool(progress), bool(progress), branch_id])
         _record_change(db, mission_id, "action_complete", f"{action_type.replace('_',' ').title()}: {title}",
                        f"{progress} new graph objects; {rationale}", before, after, .75 if progress else .4, branch_id)
+        from behive.engine.decision_ledger import record
+        record(mission_id,"controller_action",f"{action_type.replace('_',' ').title()}: {title}",
+               f"{progress} new graph objects. {rationale}",subject_key=branch_id,
+               impact="changes" if progress else "no_change",before=before,after=after,
+               reversal_conditions="Re-rank this branch if later evidence changes coverage, uncertainty, or contradiction state.")
         db.commit(); db.close()
         return {**reconcile_result, "status": "complete", "action_id": action_id,
                 "action_type": action_type, "progress": progress, "result": result}

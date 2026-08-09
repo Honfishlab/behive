@@ -53,6 +53,7 @@ def get_living_summary(mission_id: str, force: bool = False) -> dict:
       'hypotheses': [{'name':r[0],'statement':r[1],'reasoning':r[2],'status':r[3]} for r in hypotheses],
     }
     fingerprint = hashlib.sha256((SUMMARY_SCHEMA_VERSION+json.dumps(source, sort_keys=True, default=str)).encode()).hexdigest()
+    previous = db.execute("SELECT fingerprint,summary FROM hive_living_summaries WHERE mission_id=?", [mission_id]).fetchone()
     cached = db.execute("SELECT summary,generated_at FROM hive_living_summaries WHERE mission_id=? AND fingerprint=?", [mission_id,fingerprint]).fetchone()
     if cached and not force:
         db.close(); return {'mission_id':mission_id,'fingerprint':fingerprint,'generated_at':cached[1],'cached':True,**cached[0]}
@@ -113,4 +114,11 @@ Also return next_read (one sentence), coverage_note (one sentence)."""
     result['metrics'] = {'questions':len(questions),'findings':len(findings),'open_frontiers':len(frontiers),'hypotheses':len(hypotheses)}
     db.execute("INSERT INTO hive_living_summaries (mission_id,fingerprint,summary,question_count,finding_count) VALUES (?,?,?::jsonb,?,?) ON CONFLICT (mission_id) DO UPDATE SET fingerprint=EXCLUDED.fingerprint,summary=EXCLUDED.summary,question_count=EXCLUDED.question_count,finding_count=EXCLUDED.finding_count,generated_at=NOW(),updated_at=NOW()", [mission_id,fingerprint,json.dumps(result),len(questions),len(findings)])
     saved = db.execute("SELECT generated_at FROM hive_living_summaries WHERE mission_id=?", [mission_id]).fetchone(); db.close()
+    if previous and previous[0] != fingerprint:
+        from behive.engine.decision_ledger import record
+        record(mission_id,'summary_revision','Living summary revised as the evidence base changed',
+          'The synthesis was regenerated because questions, findings, frontiers, or hypotheses changed.',
+          impact='changes',before={'fingerprint':previous[0],'metrics':(previous[1] or {}).get('metrics',{})},
+          after={'fingerprint':fingerprint,'metrics':result['metrics']},questions=[q['id'] for q in source['questions']],
+          reversal_conditions='Revisit this synthesis if cited evidence is withdrawn, contradicted, or materially reclassified.')
     return {'mission_id':mission_id,'fingerprint':fingerprint,'generated_at':saved[0],'cached':False,**result}

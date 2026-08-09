@@ -788,6 +788,19 @@ async def list_boundary_research(mission_id: str):
         raise HTTPException(500, str(exc))
 
 
+@app.get("/research/{mission_id}/decisions")
+async def list_research_decisions(mission_id: str, subject_key: str | None = None, limit: int = 300):
+    """Return the source-linked audit trail explaining what changed and why."""
+    try:
+        from behive.engine.decision_ledger import list_entries
+        entries = await asyncio.to_thread(list_entries, mission_id, subject_key, max(1, min(limit, 500)))
+        counts = {}
+        for entry in entries: counts[entry['impact']] = counts.get(entry['impact'], 0) + 1
+        return {'mission_id': mission_id, 'entries': entries, 'metrics': {'total': len(entries), 'by_impact': counts}}
+    except Exception as exc:
+        raise HTTPException(500, str(exc))
+
+
 @app.post("/research/{mission_id}/boundaries")
 async def deepen_evidence_boundary(mission_id: str, body: BoundaryResearchRequest):
     try:
