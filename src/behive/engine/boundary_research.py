@@ -148,5 +148,10 @@ def get_programs(mission_id: str) -> list[dict]:
     result=[]
     for r in programs:
         obs=db.execute("SELECT id,claim,organism,substrate,process_conditions,measurement,outcome,population,evidence_class,absence_class,source_url,source_title,source_family,quality,limitations FROM hive_boundary_observations WHERE program_id=? ORDER BY CASE evidence_class WHEN 'direct' THEN 0 WHEN 'contradiction' THEN 1 WHEN 'indirect' THEN 2 ELSE 3 END,quality DESC",[r[0]]).fetchall()
+        question_id='question_'+sha1(f'{mission_id}|boundary|{r[1]}'.encode()).hexdigest()[:16]
+        operational_status={'queued':'queued','running':'researching','failed':'blocked'}.get(r[4])
+        if r[4]=='complete': operational_status='evidence_found' if obs else 'evidence_boundary'
+        if operational_status:
+            db.execute("UPDATE hive_questions SET status=? WHERE id=? AND status IS DISTINCT FROM ?",[operational_status,question_id,operational_status])
         result.append({'id':r[0],'section_key':r[1],'title':r[2],'boundary':r[3],'status':r[4],'stage':r[5],'message':r[6],'plan':r[7] or {},'metrics':r[8] or {},'error':r[9],'created_at':r[10],'updated_at':r[11],'completed_at':r[12],'observations':[{'id':x[0],'claim':x[1],'organism':x[2],'substrate':x[3],'conditions':x[4],'measurement':x[5],'outcome':x[6],'population':x[7],'evidence_class':x[8],'absence_class':x[9],'url':x[10],'source_title':x[11],'source_family':x[12],'quality':x[13],'limitations':x[14]} for x in obs]})
     db.close(); return result

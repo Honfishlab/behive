@@ -42,7 +42,7 @@ class QuestionUpdate(BaseModel):
     question: str | None = Field(default=None, min_length=8, max_length=2000)
     parent_id: str | None = None
     priority: float | None = Field(default=None, ge=0, le=1)
-    status: str | None = Field(default=None, pattern="^(open|researching|answered|paused|archived)$")
+    status: str | None = Field(default=None, pattern="^(open|queued|researching|cooldown|evidence_found|blocked|evidence_boundary|covered|answered|paused|archived)$")
 
 
 class AgentPolicy(BaseModel):
