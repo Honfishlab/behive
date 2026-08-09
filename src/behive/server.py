@@ -839,6 +839,11 @@ class DiscoveryStateUpdate(BaseModel):
     status: str = Field(pattern="^(open|investigating|paused|rejected|supported|superseded|resolved)$")
 
 
+class FrontierLifecycleAction(BaseModel):
+    action: str = Field(pattern="^(research_now|pause|refine|close)$")
+    guidance: str = Field(default="", max_length=2000)
+
+
 async def _run_frontier_background(mission_id: str, trigger: str):
     try:
         from behive.engine.frontier import run_frontier_cycle
@@ -1000,6 +1005,27 @@ async def update_frontier_state(mission_id: str, frontier_id: str, body: Discove
     row = cur.fetchone(); conn.commit(); conn.close()
     if not row: raise HTTPException(404, "Frontier not found")
     return {"id": frontier_id, "status": body.status}
+
+
+@app.get("/research/{mission_id}/frontiers/{frontier_id}/lifecycle")
+async def frontier_lifecycle(mission_id: str, frontier_id: str):
+    try:
+        from behive.engine.frontier_lifecycle import get_lifecycle
+        return await asyncio.to_thread(get_lifecycle, mission_id, frontier_id)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc))
+
+
+@app.post("/research/{mission_id}/frontiers/{frontier_id}/lifecycle/actions")
+async def frontier_lifecycle_action(mission_id: str, frontier_id: str, body: FrontierLifecycleAction):
+    try:
+        from behive.engine.frontier_lifecycle import apply_action
+        result = await asyncio.to_thread(apply_action, mission_id, frontier_id, body.action, body.guidance)
+        if body.action == "research_now" and not (_frontier_tasks.get(mission_id) and not _frontier_tasks[mission_id].done()):
+            _frontier_tasks[mission_id] = asyncio.create_task(_run_controller_background(mission_id, "manual_frontier"))
+        return result
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
 
 
 @app.patch("/research/{mission_id}/hypotheses/{hypothesis_id}")
