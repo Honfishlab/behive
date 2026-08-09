@@ -322,6 +322,22 @@ def run_frontier_cycle(mission_id: str, trigger: str = "pipeline") -> dict:
         db.close()
 
 
+def _normalize_search_strategy(value) -> dict:
+    """Keep legacy/model JSON shapes readable for every API client."""
+    if isinstance(value, dict): return value
+    if isinstance(value, list): return {"steps": value}
+    if isinstance(value, str) and value.strip():
+        text = value.strip()
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, dict): return parsed
+            if isinstance(parsed, list): return {"steps": parsed}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+        return {"strategy": text}
+    return {}
+
+
 def get_discovery_map(mission_id: str) -> dict:
     db = connect()
     ensure_schema(db)
@@ -350,7 +366,7 @@ def get_discovery_map(mission_id: str) -> dict:
         "mission_id": mission_id,
         "nodes": [{"id":r[0],"label":r[1],"type":r[2],"description":r[3] or "","state":r[4],"context":r[5] or {},"novelty":r[6]} for r in nodes],
         "edges": [{"id":r[0],"source":r[1],"target":r[2],"relation":r[3],"state":r[4],"confidence":r[5],"evidence_url":r[6] or "","excerpt":r[7] or "","conditions":r[8] or {}} for r in edges],
-        "frontiers": [{"id":r[0],"title":r[1],"type":r[2],"rationale":r[3] or "","source":r[4],"target":r[5],"absence_type":r[6],"status":r[7],"search_strategy":r[8] or {},"scores":r[9] or {},"priority":r[10]} for r in frontiers],
+        "frontiers": [{"id":r[0],"title":r[1],"type":r[2],"rationale":r[3] or "","source":r[4],"target":r[5],"absence_type":r[6],"status":r[7],"search_strategy":_normalize_search_strategy(r[8]),"scores":r[9] or {},"priority":r[10]} for r in frontiers],
         "hypotheses": [{"id":r[0],"name":r[1],"type":r[2],"statement":r[3],"reasoning":r[4] or "","path_nodes":r[5] or [],"supporting_edges":r[6] or [],"missing_links":r[7] or [],"assumptions":r[8] or [],"predictions":r[9] or [],"discriminators":r[10] or [],"safety_risks":r[11] or [],"scores":r[12] or {},"status":r[13]} for r in hypotheses],
         "cycles": [{"id":r[0],"number":r[1],"status":r[2],"trigger":r[3],"summary":r[4] or {},"started_at":r[5],"completed_at":r[6]} for r in cycles],
     }
