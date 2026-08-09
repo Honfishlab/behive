@@ -332,6 +332,11 @@ class BoundaryResearchRequest(BaseModel):
     boundary: str = Field(..., min_length=12, max_length=5000)
 
 
+class ClaimReviewAction(BaseModel):
+    decision: str = Field(pattern="^(approved|rejected|needs_more|pending)$")
+    note: str = Field(default="", max_length=2000)
+
+
 # ─── Entity Extraction (lightweight NLP) ─────────────────────────────────────
 
 _ENTITY_PATTERN = re.compile(
@@ -799,6 +804,21 @@ async def list_research_decisions(mission_id: str, subject_key: str | None = Non
         return {'mission_id': mission_id, 'entries': entries, 'metrics': {'total': len(entries), 'by_impact': counts}}
     except Exception as exc:
         raise HTTPException(500, str(exc))
+
+
+@app.get("/research/{mission_id}/reviews")
+async def list_claim_reviews(mission_id: str):
+    from behive.engine.review_queue import list_reviews
+    return await asyncio.to_thread(list_reviews, mission_id)
+
+
+@app.post("/research/{mission_id}/reviews/{claim_id}")
+async def review_claim(mission_id: str, claim_id: int, body: ClaimReviewAction):
+    try:
+        from behive.engine.review_queue import decide
+        return await asyncio.to_thread(decide, mission_id, claim_id, body.decision, body.note)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc))
 
 
 @app.post("/research/{mission_id}/boundaries")
