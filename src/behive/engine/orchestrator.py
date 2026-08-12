@@ -2301,16 +2301,21 @@ def cmd_resume(mission_id: str) -> None:
     processed = con2.execute(
         "SELECT COUNT(*) FROM hive_entities WHERE mission_id=?", [mission_id]
     ).fetchone()[0]
-    # has_synth = synthesis in DB OR status already done (FIX: do not rely solely on synthesis)
+    claim_count = con2.execute(
+        "SELECT COUNT(*) FROM hive_claims WHERE mission_id=?", [mission_id]
+    ).fetchone()[0]
+    # A narrative may be an insufficient-evidence or interrupted-run report.  It is
+    # not a completed synthesis unless processing also produced evidence claims.
     synth_row = con2.execute(
         "SELECT synthesis, status FROM hive_missions WHERE id=?", [mission_id]
     ).fetchone()
-    has_synth = bool(synth_row and synth_row[0] and len(synth_row[0]) > 500)
+    has_synth = bool(claim_count > 0 and synth_row and synth_row[0] and len(synth_row[0]) > 500)
     con2.close()
 
     log.info(f"[HIVE]   sources znalezione:  {harvested}")
     log.info(f"[HIVE]   sources z treścią:   {sources_harvested}")
     log.info(f"[HIVE]   entities przetworz:  {processed}")
+    log.info(f"[HIVE]   claims extracted:    {claim_count}")
     log.info(f"[HIVE]   synteza gotowa:      {has_synth}")
 
     # Dla cancelled/interrupted — unlock status so pipeline can continue
@@ -2335,7 +2340,7 @@ def cmd_resume(mission_id: str) -> None:
     if has_synth:
         log.info(f"[HIVE] ✅ Synteza gotowa — nic do wznowienia.")
         return
-    elif processed > 0:
+    elif processed > 0 and claim_count > 0:
         log.info(f"[HIVE] ⚡ Wznawiamy od synth (process done, {processed} entities)")
         cmd_synth(mission_id)
         run_phase('hive2_falsifier.py', ['--mission', mission_id], 'falsify')

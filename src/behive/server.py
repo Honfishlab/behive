@@ -1672,10 +1672,23 @@ async def _run_recovery(mission_id: str, stage: str):
     _mission_runtime[mission_id] = {"started_at": time.time(), "last_output_at": time.time(),
                                     "phase": stage, "returncode": None, "recovery": True}
     try:
+        if stage == "scout":
+            conn = get_db(); cur = conn.cursor()
+            cur.execute("SELECT topic,COALESCE(config,'{}'::jsonb) FROM hive_missions WHERE id=%s", (mission_id,))
+            mission_row = cur.fetchone(); conn.close()
+            if not mission_row:
+                raise RuntimeError(f"Mission {mission_id} no longer exists")
+            config = mission_row[1] or {}
+            worker_args = [sys.executable, "-m", "behive.engine", "run", mission_row[0],
+                           "--mission-id", mission_id, "--depth", str(config.get("depth", 3)),
+                           "--scale", str(config.get("scale", 200)), "--force"]
+        else:
+            worker_args = [sys.executable, "-m", "behive.engine", "resume", "--mission-id", mission_id]
         proc = await asyncio.create_subprocess_exec(
-            sys.executable, "-m", "behive.engine", "resume", "--mission-id", mission_id,
+            *worker_args,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-            env={**os.environ, "BEHIVE_MISSION_ID": mission_id, "PYTHONUNBUFFERED": "1"},
+            env={**os.environ, "BEHIVE_MISSION_ID": mission_id, "PYTHONUNBUFFERED": "1",
+                 "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"},
         )
         output_tail = []
         async for line in proc.stdout:
@@ -1817,7 +1830,8 @@ async def _run_pipeline_inner(mission_id: str, topic: str, depth: int):
             "--depth", str(depth),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
-            env={**os.environ, "BEHIVE_MISSION_ID": mission_id, "PYTHONUNBUFFERED": "1"},
+            env={**os.environ, "BEHIVE_MISSION_ID": mission_id, "PYTHONUNBUFFERED": "1",
+                 "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"},
         )
 
         # Parse subprocess output for phase transitions and progress
