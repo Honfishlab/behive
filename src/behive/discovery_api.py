@@ -77,6 +77,11 @@ class QuestionArchitectureApply(BaseModel):
     mode: str = Field(default="replace", pattern="^(replace|merge)$")
 
 
+class QuestionControl(BaseModel):
+    action: str = Field(pattern="^(research_now|pause|resume|reopen|mark_covered)$")
+    priority: float | None = Field(default=None, ge=0, le=1)
+
+
 def _ensure_architect_schema(cur):
     cur.execute("""
         CREATE TABLE IF NOT EXISTS hive_question_architectures (
@@ -390,7 +395,8 @@ def project_map(project_id: str):
         if not project:
             raise HTTPException(404, "Research project not found")
         cur.execute(
-            "SELECT id,parent_id,question,depth,kind,priority,confidence,status,mission_id "
+            "SELECT id,parent_id,question,depth,kind,priority,confidence,status,mission_id,"
+            "COALESCE(evidence_completeness,'{}'::jsonb),COALESCE(attempts,0),last_researched_at "
             "FROM hive_questions WHERE project_id=%s ORDER BY depth,created_at",
             (project_id,),
         )
@@ -404,7 +410,8 @@ def project_map(project_id: str):
         findings = cur.fetchall()
     nodes = [
         {"id": q[0], "type": "question", "parent_id": q[1], "label": q[2], "depth": q[3],
-         "kind": q[4], "priority": q[5], "confidence": q[6], "status": q[7], "mission_id": q[8]}
+         "kind": q[4], "priority": q[5], "confidence": q[6], "status": q[7], "mission_id": q[8],
+         "evidence_completeness": q[9], "attempts": q[10], "last_researched_at": q[11]}
         for q in questions
     ]
     nodes += [
@@ -419,6 +426,28 @@ def project_map(project_id: str):
     ]
     return {"project": {"id": project[0], "title": project[1], "root_question": project[2], "status": project[3]},
             "nodes": nodes, "edges": edges}
+
+
+@router.post("/{project_id}/questions/{question_id}/control")
+def control_question(project_id: str, question_id: str, payload: QuestionControl):
+    with _db() as conn, conn.cursor() as cur:
+        cur.execute("SELECT status,mission_id FROM hive_questions WHERE id=%s AND project_id=%s",
+                    (question_id, project_id))
+        row = cur.fetchone()
+        if not row: raise HTTPException(404, "Question not found")
+        status = {"pause":"paused","resume":"open","reopen":"open","research_now":"open",
+                  "mark_covered":"covered"}[payload.action]
+        cur.execute("UPDATE hive_questions SET status=%s,priority=COALESCE(%s,CASE WHEN %s='research_now' THEN 1 ELSE priority END),"
+                    "updated_at=NOW() WHERE id=%s", (status,payload.priority,payload.action,question_id))
+        cur.execute("SELECT id FROM hive_missions WHERE project_id=%s AND question_id IN "
+                    "(SELECT id FROM hive_questions WHERE project_id=%s AND parent_id IS NULL) "
+                    "ORDER BY created_at DESC LIMIT 1", (project_id,project_id))
+        controller = cur.fetchone()
+        if controller and payload.action in ("research_now","resume","reopen"):
+            cur.execute("UPDATE hive_research_branches SET status='watching',no_progress_cycles=0,duplicate_streak=0,"
+                        "next_review_at=NULL,updated_at=NOW() WHERE mission_id=%s AND subject_type='question' AND subject_id=%s",
+                        (controller[0],question_id))
+    return {"id":question_id,"action":payload.action,"status":status}
 
 
 @router.get("/{project_id}/frontier")

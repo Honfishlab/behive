@@ -183,6 +183,8 @@ async def lifespan(app: FastAPI):
         cur = conn.cursor()
         cur.execute("SELECT 1")
         conn.close()
+        from behive.engine.controller import ensure_schema as ensure_controller_schema
+        await asyncio.to_thread(ensure_controller_schema)
         print("✅ PostgreSQL connected")
     except RuntimeError as e:
         print(f"⚠️  Database not available: {e}")

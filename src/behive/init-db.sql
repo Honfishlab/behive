@@ -355,6 +355,10 @@ CREATE TABLE IF NOT EXISTS hive_questions (
     priority REAL NOT NULL DEFAULT 0.5,
     confidence REAL NOT NULL DEFAULT 0.0,
     status TEXT NOT NULL DEFAULT 'open',
+    evidence_completeness JSONB NOT NULL DEFAULT '{}'::jsonb,
+    success_criteria JSONB NOT NULL DEFAULT '{}'::jsonb,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_researched_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
