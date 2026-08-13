@@ -25,6 +25,8 @@ CREATE TABLE IF NOT EXISTS hive_missions (
     synthesis TEXT,
     think_mode BOOLEAN DEFAULT FALSE,
     config JSONB DEFAULT '{}'::jsonb,
+    project_id TEXT,
+    question_id TEXT,
     quality_coverage REAL,
     quality_depth REAL,
     quality_confidence REAL,

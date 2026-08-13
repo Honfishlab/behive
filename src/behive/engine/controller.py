@@ -9,6 +9,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import subprocess
+import sys
+import time
 from datetime import datetime, timedelta
 from hashlib import sha1
 
@@ -66,6 +70,8 @@ def ensure_schema(db=None) -> None:
     db = db or connect()
     for statement in (part.strip() for part in SCHEMA.split(";") if part.strip()):
         db.execute(statement)
+    db.execute("ALTER TABLE hive_missions ADD COLUMN IF NOT EXISTS project_id TEXT")
+    db.execute("ALTER TABLE hive_missions ADD COLUMN IF NOT EXISTS question_id TEXT")
     if owned:
         db.close()
 
@@ -99,12 +105,34 @@ def _record_change(db, mission_id: str, change_type: str, headline: str, detail:
 
 
 def _sync_branches(db, mission_id: str) -> int:
+    mission = db.execute("SELECT project_id FROM hive_missions WHERE id=?", [mission_id]).fetchone()
+    project_id = mission[0] if mission else None
+    questions = db.execute(
+        "SELECT id,question,priority,confidence,status FROM hive_questions WHERE project_id=? "
+        "AND status IN ('open','queued','researching','blocked','evidence_boundary') ORDER BY priority DESC,depth,id",
+        [project_id],
+    ).fetchall() if project_id else []
+    synced = 0
+    for qid, title, priority, confidence, status in questions:
+        bid = _branch_id(mission_id, "question", qid)
+        coverage = max(0, min(1, float(confidence or 0)))
+        branch_status = "watching" if status != "blocked" else "blocked"
+        db.execute(
+            """INSERT INTO hive_research_branches
+               (id,mission_id,subject_type,subject_id,title,status,reason,uncertainty,evidence_coverage,priority)
+               VALUES (?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT (id) DO UPDATE SET title=EXCLUDED.title,status=EXCLUDED.status,
+               uncertainty=EXCLUDED.uncertainty,evidence_coverage=EXCLUDED.evidence_coverage,
+               priority=EXCLUDED.priority,updated_at=NOW()""",
+            [bid, mission_id, "question", qid, title, branch_status,
+             "Open question-tree branch awaiting targeted evidence", 1-coverage, coverage, float(priority or .5)],
+        )
+        synced += 1
     frontiers = db.execute(
         "SELECT id,title,frontier_type,rationale,scores,priority,status FROM hive_frontiers "
         "WHERE mission_id=? AND status NOT IN ('archived','dismissed') ORDER BY priority DESC",
         [mission_id],
     ).fetchall()
-    synced = 0
     for fid, title, ftype, rationale, scores, priority, status in frontiers:
         scores = scores or {}
         evidence = float(scores.get("evidence_strength", 0) or 0)
@@ -126,7 +154,10 @@ def _sync_branches(db, mission_id: str) -> int:
 
 def _choose_action(branch: tuple) -> tuple[str, str, dict]:
     bid, subject_id, title, status, reason, uncertainty, coverage, priority, retries, duplicates, stagnant = branch
-    if coverage < .3:
+    if str(bid).startswith("rb_") and reason == "Open question-tree branch awaiting targeted evidence":
+        kind = "research_question"
+        rationale = "This ranked question-tree branch has no linked evidence mission; run targeted research and attach its results."
+    elif coverage < .3:
         kind = "refresh_evidence_map"
         rationale = "Evidence coverage is low; inspect newly available mission documents and missing connections."
     elif stagnant > 0:
@@ -143,6 +174,56 @@ def _choose_action(branch: tuple) -> tuple[str, str, dict]:
         "cost": .2 if kind == "audit_graph" else .45,
     }
     return kind, rationale, metrics
+
+
+def _research_question(mission_id: str, branch_id: str) -> dict:
+    """Research one queued question and retain its own evidence mission."""
+    db = connect()
+    row = db.execute(
+        "SELECT b.subject_id,b.title,m.project_id FROM hive_research_branches b "
+        "JOIN hive_missions m ON m.id=b.mission_id WHERE b.id=? AND b.subject_type='question'",
+        [branch_id],
+    ).fetchone()
+    if not row:
+        db.close()
+        raise RuntimeError("Question branch is no longer available")
+    question_id, question, project_id = row
+    child_id = f"question_{int(time.time())}_{question_id[-6:]}"
+    db.execute(
+        "INSERT INTO hive_missions (id,topic,status,phase,config,project_id,question_id,created_at) "
+        "VALUES (?,?,'queued','queued',?::jsonb,?,?,NOW())",
+        [child_id, question, json.dumps({"depth": 4, "scale": 80, "parent_mission": mission_id}),
+         project_id, question_id],
+    )
+    db.execute("UPDATE hive_questions SET mission_id=?,status='researching',updated_at=NOW() WHERE id=?",
+               [child_id, question_id])
+    db.commit()
+    db.close()
+    env = {**os.environ, "BEHIVE_MISSION_ID": child_id, "PYTHONUNBUFFERED": "1",
+           "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
+    proc = subprocess.run(
+        [sys.executable, "-m", "behive.engine", "run", question, "--mission-id", child_id,
+         "--depth", "4", "--scale", "80", "--force"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", env=env, timeout=1800,
+    )
+    db = connect()
+    result = db.execute(
+        "SELECT status,(SELECT COUNT(*) FROM hive_claims WHERE mission_id=?) FROM hive_missions WHERE id=?",
+        [child_id, child_id],
+    ).fetchone() or ("error", 0)
+    child_status, claims = result
+    question_status = "evidence_found" if claims else "evidence_boundary" if child_status == "insufficient" else "blocked"
+    db.execute(
+        "UPDATE hive_questions SET status=?,confidence=CASE WHEN ?>0 THEN GREATEST(confidence,.5) "
+        "ELSE confidence END,updated_at=NOW() WHERE id=?",
+        [question_status, claims, question_id],
+    )
+    db.commit()
+    db.close()
+    if proc.returncode != 0:
+        raise RuntimeError(f"Question research worker exited {proc.returncode}: {proc.stdout[-600:]}")
+    return {"child_mission_id": child_id, "question_id": question_id,
+            "status": child_status, "claims": claims}
 
 
 def compact_pending_queue(db, mission_id: str) -> dict:
@@ -257,7 +338,9 @@ def run_next_action(mission_id: str, trigger: str = "continuous") -> dict:
     db.commit(); db.close()
     before = reconcile_result["after"]
     try:
-        if action_type == "refresh_evidence_map":
+        if action_type == "research_question":
+            result = _research_question(mission_id, branch_id)
+        elif action_type == "refresh_evidence_map":
             from behive.engine.frontier import run_frontier_cycle
             result = run_frontier_cycle(mission_id, trigger=f"controller:{trigger}")
         elif action_type == "evolve_hypotheses":
@@ -335,7 +418,7 @@ def get_controller_state(mission_id: str) -> dict:
     cooldown_seconds = max(0, int(300-elapsed)) if elapsed is not None else 0
     policy_row = db.execute(
         "SELECT p.agent_policy FROM hive_projects p JOIN hive_missions m "
-        "ON LOWER(TRIM(m.topic))=LOWER(TRIM(p.root_question)) WHERE m.id=? LIMIT 1", [mission_id]
+        "ON m.project_id=p.id WHERE m.id=? LIMIT 1", [mission_id]
     ).fetchone()
     policy = policy_row[0] if policy_row and policy_row[0] else {}
     running_count = status_counts.get("running", 0)

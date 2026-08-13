@@ -141,7 +141,7 @@ async def _continuous_discovery_loop():
             conn = get_db(); cur = conn.cursor()
             cur.execute("""
                 SELECT DISTINCT ON (p.id) m.id,p.cadence_minutes
-                FROM hive_projects p JOIN hive_missions m ON LOWER(TRIM(m.topic))=LOWER(TRIM(p.root_question))
+                FROM hive_projects p JOIN hive_missions m ON m.project_id=p.id
                 WHERE COALESCE(p.agent_policy->>'autonomy','assisted')='continuous'
                   AND COALESCE(p.agent_policy->>'status','paused')='running'
                   AND m.status IN ('done','insufficient')
@@ -294,6 +294,8 @@ class ResearchRequest(BaseModel):
     depth: int = Field(default=3, ge=1, le=5, description="1=quick, 3=standard, 5=deep")
     scale: int = Field(default=200, ge=10, le=500, description="Max sources to scout")
     force: bool = Field(True, description="Skip dedup check")
+    project_id: str | None = Field(default=None, description="Owning living-research project")
+    question_id: str | None = Field(default=None, description="Question-tree node that triggered this mission")
     
     @property
     def effective_query(self) -> str:
@@ -428,11 +430,18 @@ async def start_research(req: ResearchRequest):
     try:
         conn = get_db()
         cur = conn.cursor()
+        cur.execute("ALTER TABLE hive_missions ADD COLUMN IF NOT EXISTS project_id TEXT")
+        cur.execute("ALTER TABLE hive_missions ADD COLUMN IF NOT EXISTS question_id TEXT")
         cur.execute("""
-            INSERT INTO hive_missions (id, topic, status, phase, config, created_at)
-            VALUES (%s, %s, 'queued', 'queued', %s::jsonb, NOW())
+            INSERT INTO hive_missions (id, topic, status, phase, config, project_id, question_id, created_at)
+            VALUES (%s, %s, 'queued', 'queued', %s::jsonb, %s, %s, NOW())
             ON CONFLICT (id) DO NOTHING
-        """, (mission_id, req.effective_query, json.dumps({"depth": req.depth, "scale": req.scale})))
+        """, (mission_id, req.effective_query, json.dumps({"depth": req.depth, "scale": req.scale}),
+              req.project_id, req.question_id))
+        if req.question_id:
+            cur.execute("UPDATE hive_questions SET mission_id=%s,status='researching',updated_at=NOW() "
+                        "WHERE id=%s AND (%s IS NULL OR project_id=%s)",
+                        (mission_id, req.question_id, req.project_id, req.project_id))
         conn.commit()
         conn.close()
     except Exception as e:
