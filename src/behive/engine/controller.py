@@ -12,7 +12,6 @@ import logging
 import os
 import subprocess
 import sys
-import time
 from datetime import datetime, timedelta
 from hashlib import sha1
 
@@ -107,6 +106,21 @@ def _record_change(db, mission_id: str, change_type: str, headline: str, detail:
 def _sync_branches(db, mission_id: str) -> int:
     mission = db.execute("SELECT project_id FROM hive_missions WHERE id=?", [mission_id]).fetchone()
     project_id = mission[0] if mission else None
+    if project_id:
+        db.execute(
+            "UPDATE hive_research_branches b SET status='satisfied',updated_at=NOW() "
+            "FROM hive_questions q WHERE b.mission_id=? AND b.subject_type='question' "
+            "AND b.subject_id=q.id AND q.project_id=? "
+            "AND q.status IN ('evidence_found','covered','answered','paused','archived')",
+            [mission_id, project_id],
+        )
+        db.execute(
+            "UPDATE hive_research_actions a SET status='superseded',completed_at=NOW(),"
+            "error_message='Question already reached a terminal tree status' "
+            "FROM hive_research_branches b WHERE a.branch_id=b.id AND b.mission_id=? "
+            "AND b.status='satisfied' AND a.status IN ('queued','retrying')",
+            [mission_id],
+        )
     questions = db.execute(
         "SELECT id,question,priority,confidence,status FROM hive_questions WHERE project_id=? "
         "AND status IN ('open','queued','researching','blocked','evidence_boundary') ORDER BY priority DESC,depth,id",
@@ -176,7 +190,7 @@ def _choose_action(branch: tuple) -> tuple[str, str, dict]:
     return kind, rationale, metrics
 
 
-def _research_question(mission_id: str, branch_id: str) -> dict:
+def _research_question(mission_id: str, branch_id: str, action_id: int) -> dict:
     """Research one queued question and retain its own evidence mission."""
     db = connect()
     row = db.execute(
@@ -188,10 +202,18 @@ def _research_question(mission_id: str, branch_id: str) -> dict:
         db.close()
         raise RuntimeError("Question branch is no longer available")
     question_id, question, project_id = row
-    child_id = f"question_{int(time.time())}_{question_id[-6:]}"
+    child_id = f"question_action_{action_id}"
+    existing = db.execute(
+        "SELECT status,(SELECT COUNT(*) FROM hive_claims WHERE mission_id=?) FROM hive_missions WHERE id=?",
+        [child_id, child_id],
+    ).fetchone()
+    if existing and existing[0] in ("done", "insufficient"):
+        db.close()
+        return {"child_mission_id": child_id, "question_id": question_id,
+                "status": existing[0], "claims": existing[1], "reused": True}
     db.execute(
         "INSERT INTO hive_missions (id,topic,status,phase,config,project_id,question_id,created_at) "
-        "VALUES (?,?,'queued','queued',?::jsonb,?,?,NOW())",
+        "VALUES (?,?,'queued','queued',?::jsonb,?,?,NOW()) ON CONFLICT (id) DO NOTHING",
         [child_id, question, json.dumps({"depth": 4, "scale": 80, "parent_mission": mission_id}),
          project_id, question_id],
     )
@@ -315,8 +337,8 @@ def reconcile(mission_id: str, trigger: str = "controller") -> dict:
             "before": before, "after": after}
 
 
-def run_next_action(mission_id: str, trigger: str = "continuous") -> dict:
-    """Claim and execute the highest-value queued action for one mission."""
+def _run_next_action_locked(mission_id: str, trigger: str = "continuous") -> dict:
+    """Claim and execute an action while the caller owns the mission lease."""
     reconcile_result = reconcile(mission_id, trigger)
     db = connect(); ensure_schema(db)
     row = db.execute(
@@ -339,7 +361,7 @@ def run_next_action(mission_id: str, trigger: str = "continuous") -> dict:
     before = reconcile_result["after"]
     try:
         if action_type == "research_question":
-            result = _research_question(mission_id, branch_id)
+            result = _research_question(mission_id, branch_id, action_id)
         elif action_type == "refresh_evidence_map":
             from behive.engine.frontier import run_frontier_cycle
             result = run_frontier_cycle(mission_id, trigger=f"controller:{trigger}")
@@ -381,6 +403,26 @@ def run_next_action(mission_id: str, trigger: str = "continuous") -> dict:
                        {"attempt": attempt_now-1}, {"attempt": attempt_now, "terminal": terminal}, .8, branch_id)
         db.commit(); db.close()
         raise
+
+
+def run_next_action(mission_id: str, trigger: str = "continuous") -> dict:
+    """Execute at most one action across every Behive server sharing PostgreSQL."""
+    lease_db = connect()
+    acquired = lease_db.execute(
+        "SELECT pg_try_advisory_lock(hashtextextended(?,0))", [f"behive-controller:{mission_id}"]
+    ).fetchone()[0]
+    if not acquired:
+        lease_db.close()
+        return {"mission_id": mission_id, "status": "busy",
+                "reason": "Another Behive server owns this mission's controller lease"}
+    try:
+        return _run_next_action_locked(mission_id, trigger)
+    finally:
+        try:
+            lease_db.execute("SELECT pg_advisory_unlock(hashtextextended(?,0))",
+                             [f"behive-controller:{mission_id}"])
+        finally:
+            lease_db.close()
 
 
 def get_controller_state(mission_id: str) -> dict:
