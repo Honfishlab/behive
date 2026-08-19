@@ -58,14 +58,18 @@ Return JSON: verdict supported|unsupported|ambiguous, score 0-1, exact_quote cop
             if not quote_valid: quote=''
             if quote: locator=f"Source text near character {lower.find(quote.lower())+1}"
             checks['entailment_verdict']=verdict; checks['quote_verified_verbatim']=quote_valid
-    quarantined=status!='supported'; details={'reason':reason,'supporting_quote':quote,'locator':locator,'checks':checks,'source_url':url}
-    db.execute("INSERT INTO hive_citation_audits (mission_id,claim_id,status,score,reason,supporting_quote,locator,source_url,checks) VALUES (?,?,?,?,?,?,?,?,?::jsonb) ON CONFLICT (mission_id,claim_id) DO UPDATE SET status=EXCLUDED.status,score=EXCLUDED.score,reason=EXCLUDED.reason,supporting_quote=EXCLUDED.supporting_quote,locator=EXCLUDED.locator,source_url=EXCLUDED.source_url,checks=EXCLUDED.checks,updated_at=NOW()",[mission_id,claim_id,status,score,reason,quote,locator,url,json.dumps(checks)]); db.execute("UPDATE hive_claims SET integrity_status=?,integrity_score=?,integrity_details=?::jsonb,is_garbage=? WHERE id=? AND mission_id=?",[status,score,json.dumps(details),quarantined,claim_id,mission_id]); db.close()
+    direct_text=f"{quote} {evidence or ''}".lower()
+    direct_signals=bool(re.search(r'\b(measur(?:e|ed|ement)|observ(?:e|ed|ation)|assay|cohort|participants?|patients?|mice|mouse|rats?|cells?|tissue|western blot|immuno(?:histochemistry|fluorescence)|microscopy|expression|concentration|dose|significant|fold change)\b|\d+(?:\.\d+)?\s*%',direct_text))
+    evidence_class='direct' if status=='supported' and direct_signals else 'indirect'
+    checks['direct_evidence_signals']=direct_signals
+    quarantined=status!='supported'; details={'reason':reason,'supporting_quote':quote,'locator':locator,'checks':checks,'source_url':url,'evidence_class':evidence_class}
+    db.execute("INSERT INTO hive_citation_audits (mission_id,claim_id,status,score,reason,supporting_quote,locator,source_url,checks) VALUES (?,?,?,?,?,?,?,?,?::jsonb) ON CONFLICT (mission_id,claim_id) DO UPDATE SET status=EXCLUDED.status,score=EXCLUDED.score,reason=EXCLUDED.reason,supporting_quote=EXCLUDED.supporting_quote,locator=EXCLUDED.locator,source_url=EXCLUDED.source_url,checks=EXCLUDED.checks,updated_at=NOW()",[mission_id,claim_id,status,score,reason,quote,locator,url,json.dumps(checks)]); db.execute("UPDATE hive_claims SET integrity_status=?,integrity_score=?,integrity_details=?::jsonb,quality_details=COALESCE(quality_details,'{}'::jsonb)||?::jsonb,is_garbage=? WHERE id=? AND mission_id=?",[status,score,json.dumps(details),json.dumps({'evidence_class':evidence_class,'citation_audited':True}),quarantined,claim_id,mission_id]); db.close()
     from behive.engine.decision_ledger import record
     record(mission_id,'citation_integrity',f'{"Supported" if status=="supported" else "Quarantined"}: {claim[:240]}',reason,impact='supports' if status=='supported' else 'weakens',before={'integrity':'unaudited'},after={'integrity':status,'quarantined':quarantined,'score':score},confidence_after=score,source_url=url,reversal_conditions='Re-audit when corrected full text, a valid passage locator, or materially different evidence is supplied.')
     return {'claim_id':claim_id,'status':status,'score':score,'quarantined':quarantined,**details}
 
-def audit_mission(mission_id:str,limit:int=100)->dict:
-    db=connect(); ensure_schema(db); ids=[r[0] for r in db.execute("SELECT id FROM hive_claims WHERE mission_id=? ORDER BY CASE integrity_status WHEN 'unaudited' THEN 0 ELSE 1 END,quality_score DESC LIMIT ?",[mission_id,limit]).fetchall()]; db.close(); results=[]
+def audit_mission(mission_id:str,limit:int=100,only_unaudited:bool=False)->dict:
+    db=connect(); ensure_schema(db); where="AND COALESCE(integrity_status,'unaudited')='unaudited'" if only_unaudited else ""; ids=[r[0] for r in db.execute(f"SELECT id FROM hive_claims WHERE mission_id=? {where} ORDER BY CASE integrity_status WHEN 'unaudited' THEN 0 ELSE 1 END,quality_score DESC LIMIT ?",[mission_id,limit]).fetchall()]; db.close(); results=[]
     for cid in ids:
         try: results.append(audit_claim(mission_id,cid))
         except Exception as exc: results.append({'claim_id':cid,'status':'error','reason':str(exc)[:500]})

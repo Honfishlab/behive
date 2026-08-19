@@ -46,6 +46,7 @@ def test_finalize_question_mission_promotes_and_seeds_queue():
          patch.object(controller, "_score_question", return_value=completeness), \
          patch.object(controller, "_expand_residual_unknowns", return_value=0), \
          patch.object(controller, "_propagate_question_state"), \
+         patch("behive.engine.citation_auditor.audit_mission", return_value={"audited": 0}), \
          patch.object(discovery_paths, "generate_paths", return_value={"generated": 2}), \
          patch.object(discovery_paths, "activate_ranked", return_value={"activated": 1}), \
          patch.object(controller, "reconcile", return_value=queue):
@@ -67,6 +68,7 @@ def test_finalize_question_mission_is_idempotent_per_question_mission():
          patch.object(controller, "_score_question", return_value=completeness), \
          patch.object(controller, "_expand_residual_unknowns") as expand, \
          patch.object(controller, "_propagate_question_state"), \
+         patch("behive.engine.citation_auditor.audit_mission", return_value={"audited": 0}), \
          patch.object(discovery_paths, "generate_paths", return_value={"generated": 0}), \
          patch.object(discovery_paths, "activate_ranked", return_value={"activated": 0}), \
          patch.object(controller, "reconcile", return_value={}):
@@ -86,13 +88,28 @@ def test_finalize_question_mission_ignores_unlinked_missions():
 
 
 def test_question_score_sql_does_not_confuse_adapter_placeholders():
+    class Rows(Result):
+        def fetchall(self):
+            return self.row
+
     class ScoreDB:
         def execute(self, sql, params=None):
             assert sql.count("?") == len(params or [])
-            return Result((3, 3, 3, 2, 1, 0))
+            if "SELECT project_id,question_id" in sql:
+                return Result(("project_1", "question_1"))
+            if "SELECT id FROM hive_missions" in sql:
+                return Rows([("mission_1",)])
+            if "FROM hive_claims WHERE mission_id=ANY" in sql:
+                return Rows([
+                    ("supported", "https://doi.org/10.1002/one", {"evidence_class":"direct"}, {}, "observation", "measured"),
+                    ("supported", "https://doi.org/10.3389/two", {}, {}, "finding", "evidence"),
+                    ("supported", "https://example.org/three", {}, {}, "finding", "evidence"),
+                ])
+            raise AssertionError(sql)
 
     score = controller._score_question(ScoreDB(), "question_1", "mission_1")
     assert score["status"] == "covered"
+    assert score["domains"] == 3
 
 
 def test_child_mission_resolves_to_root_controller_anchor():

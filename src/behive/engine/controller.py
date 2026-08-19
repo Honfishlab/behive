@@ -12,6 +12,7 @@ import logging
 import os
 import subprocess
 import sys
+from urllib.parse import urlparse
 from datetime import datetime, timedelta
 from hashlib import sha1
 
@@ -145,6 +146,25 @@ def _sync_branches(db, mission_id: str) -> int:
     mission = db.execute("SELECT project_id FROM hive_missions WHERE id=?", [mission_id]).fetchone()
     project_id = mission[0] if mission else None
     if project_id:
+        # Repair legacy questions whose intrinsic evidence score survived but whose
+        # status was later overwritten by incomplete child coverage.
+        db.execute(
+            "UPDATE hive_questions SET status='evidence_found',"
+            "confidence=GREATEST(COALESCE(confidence,0),COALESCE((evidence_completeness->>'score')::double precision,0)),"
+            "updated_at=NOW() WHERE project_id=? AND status IN ('open','queued') "
+            "AND COALESCE((evidence_completeness->>'findings')::integer,0)>0 "
+            "AND COALESCE((evidence_completeness->>'score')::double precision,0)>0",
+            [project_id],
+        )
+        # Residual gap probes are recovery tasks, not permanent research goals.
+        # Retire them once their parent reaches verified coverage.
+        db.execute(
+            "UPDATE hive_questions child SET status='archived',updated_at=NOW() "
+            "FROM hive_questions parent WHERE child.parent_id=parent.id "
+            "AND child.project_id=? AND child.kind='evidence gap' "
+            "AND child.status IN ('open','queued','blocked','evidence_boundary') "
+            "AND parent.status IN ('covered','answered')", [project_id],
+        )
         db.execute(
             "UPDATE hive_research_branches b SET status='satisfied',updated_at=NOW() "
             "FROM hive_questions q WHERE b.mission_id=? AND b.subject_type='question' "
@@ -163,25 +183,29 @@ def _sync_branches(db, mission_id: str) -> int:
     # evidence gaps have already been expanded into their own child questions;
     # reactivating the parent here causes duplicate missions and starves them.
     questions = db.execute(
-        "SELECT id,question,priority,confidence,status FROM hive_questions WHERE project_id=? "
+        "SELECT id,question,priority,confidence,status,kind FROM hive_questions WHERE project_id=? "
         "AND status IN ('open','queued','researching','blocked','evidence_boundary') "
         "ORDER BY priority DESC,depth,id",
         [project_id],
     ).fetchall() if project_id else []
     synced = 0
-    for qid, title, priority, confidence, status in questions:
+    for qid, title, priority, confidence, status, question_kind in questions:
         bid = _branch_id(mission_id, "question", qid)
         coverage = max(0, min(1, float(confidence or 0)))
         branch_status = "watching" if status != "blocked" else "blocked"
+        targeted_gap = str(question_kind or '').lower() == 'evidence gap'
+        branch_reason = ("Targeted evidence gap requiring primary-source recovery" if targeted_gap else
+                         "Open question-tree branch awaiting targeted evidence")
+        branch_priority = max(.98, float(priority or .5)) if targeted_gap else float(priority or .5)
         db.execute(
             """INSERT INTO hive_research_branches
                (id,mission_id,subject_type,subject_id,title,status,reason,uncertainty,evidence_coverage,priority)
                VALUES (?,?,?,?,?,?,?,?,?,?)
-               ON CONFLICT (id) DO UPDATE SET title=EXCLUDED.title,status=EXCLUDED.status,
+               ON CONFLICT (id) DO UPDATE SET title=EXCLUDED.title,status=EXCLUDED.status,reason=EXCLUDED.reason,
                uncertainty=EXCLUDED.uncertainty,evidence_coverage=EXCLUDED.evidence_coverage,
                priority=EXCLUDED.priority,updated_at=NOW()""",
             [bid, mission_id, "question", qid, title, branch_status,
-             "Open question-tree branch awaiting targeted evidence", 1-coverage, coverage, float(priority or .5)],
+             branch_reason, 1-coverage, coverage, branch_priority],
         )
         synced += 1
     frontiers = db.execute(
@@ -210,7 +234,10 @@ def _sync_branches(db, mission_id: str) -> int:
 
 def _choose_action(branch: tuple) -> tuple[str, str, dict]:
     bid, subject_id, title, status, reason, uncertainty, coverage, priority, retries, duplicates, stagnant = branch
-    if str(bid).startswith("rb_") and reason == "Open question-tree branch awaiting targeted evidence":
+    if str(bid).startswith("rb_") and reason in (
+        "Open question-tree branch awaiting targeted evidence",
+        "Targeted evidence gap requiring primary-source recovery",
+    ):
         kind = "research_question"
         rationale = "This ranked question-tree branch has no linked evidence mission; run targeted research and attach its results."
     elif coverage < .3:
@@ -237,15 +264,32 @@ def _score_question(db, question_id: str, mission_id: str | None) -> dict:
     if not mission_id:
         return {"score": 0, "findings": 0, "audited": 0, "sources": 0, "domains": 0,
                 "direct": 0, "contradictions": 0, "status": "queued", "gaps": ["No research mission has run"]}
-    row = db.execute(
-        "SELECT COUNT(*),COUNT(*) FILTER (WHERE integrity_status='supported'),"
-        "COUNT(DISTINCT source_url),COUNT(DISTINCT NULLIF(split_part(split_part(source_url,'://',2),'/',1),'')),"
-        "COUNT(*) FILTER (WHERE COALESCE(quality_details->>'evidence_class','')='direct'),"
-        "COUNT(*) FILTER (WHERE claim_type ILIKE ?) "
-        "FROM hive_claims WHERE mission_id=? AND COALESCE(is_garbage,FALSE)=FALSE",
-        ["%contradict%", mission_id]
-    ).fetchone()
-    findings, audited, sources, domains, direct, contradictions = [int(v or 0) for v in row]
+    link = db.execute("SELECT project_id,question_id FROM hive_missions WHERE id=?", [mission_id]).fetchone()
+    mission_ids = [mission_id]
+    if link and link[0] and link[1]:
+        mission_ids = [r[0] for r in db.execute(
+            "SELECT id FROM hive_missions WHERE project_id=? AND question_id=? "
+            "AND status IN ('done','insufficient') ORDER BY created_at", [link[0],link[1]]
+        ).fetchall()] or mission_ids
+    rows = db.execute(
+        "SELECT integrity_status,source_url,COALESCE(quality_details,'{}'::jsonb),"
+        "COALESCE(integrity_details,'{}'::jsonb),COALESCE(claim_type,''),COALESCE(evidence,'') "
+        "FROM hive_claims WHERE mission_id=ANY(?) AND COALESCE(is_garbage,FALSE)=FALSE",
+        [mission_ids],
+    ).fetchall()
+    findings=len(rows); audited=sum(r[0]=='supported' for r in rows)
+    source_urls={r[1] for r in rows if r[1]}; sources=len(source_urls)
+    provenance=set()
+    for url in source_urls:
+        parsed=urlparse(url); host=(parsed.hostname or '').lower().removeprefix('www.')
+        if host in ('doi.org','dx.doi.org'):
+            prefix=(parsed.path.lstrip('/').split('/',1)[0] or '').lower()
+            provenance.add(f'doi-registrant:{prefix}' if prefix else host)
+        elif host: provenance.add(host)
+    domains=len(provenance)
+    direct=sum(r[0]=='supported' and ((r[2] or {}).get('evidence_class')=='direct' or
+               (r[3] or {}).get('evidence_class')=='direct') for r in rows)
+    contradictions=sum('contradict' in r[4].lower() for r in rows)
     audit_ratio = audited / findings if findings else 0
     score = min(1, .25*min(findings/3,1)+.25*audit_ratio+.2*min(sources/3,1)+
                 .15*min(domains/2,1)+.15*min(direct/1,1))
@@ -256,7 +300,8 @@ def _score_question(db, question_id: str, mission_id: str | None) -> dict:
     if direct < 1: gaps.append("No direct evidence identified")
     status = "covered" if score >= .75 and not gaps else "evidence_found" if findings else "evidence_boundary"
     return {"score": round(score,4), "findings": findings, "audited": audited, "sources": sources,
-            "domains": domains, "direct": direct, "contradictions": contradictions,
+            "domains": domains, "provenance_groups": sorted(provenance), "attempt_missions": mission_ids,
+            "direct": direct, "contradictions": contradictions,
             "status": status, "gaps": gaps}
 
 
@@ -273,10 +318,19 @@ def _propagate_question_state(db, question_id: str) -> None:
         active = sum(1 for status,_ in rows if status == 'researching')
         scores = [float((details or {}).get('score',0) or 0) for _,details in rows]
         aggregate = round(sum(scores)/len(scores),4) if scores else 0
-        parent_status = 'researching' if active else 'covered' if covered == len(rows) else 'evidence_found' if covered else 'open'
+        own = db.execute("SELECT status,confidence,COALESCE(evidence_completeness,'{}'::jsonb) FROM hive_questions WHERE id=?", [parent_id]).fetchone()
+        own_status,own_confidence,own_details = own if own else ('open',0,{})
+        intrinsic=float((own_details or {}).get('score',0) or 0)
+        if covered == len(rows): parent_status='covered'
+        elif own_status in ('evidence_found','covered','answered','evidence_boundary'): parent_status=own_status
+        elif intrinsic>0: parent_status='evidence_found'
+        elif active: parent_status='researching'
+        elif covered: parent_status='evidence_found'
+        else: parent_status='open'
+        displayed_confidence=max(float(own_confidence or 0),intrinsic,aggregate)
         db.execute("UPDATE hive_questions SET status=?,confidence=?,evidence_completeness="
                    "COALESCE(evidence_completeness,'{}'::jsonb)||?::jsonb,updated_at=NOW() WHERE id=?",
-                   [parent_status, aggregate, json.dumps({"child_coverage": aggregate,"children_covered": covered,
+                   [parent_status, displayed_confidence, json.dumps({"child_coverage": aggregate,"children_covered": covered,
                     "children_total": len(rows)}), parent_id])
         current = parent_id
 
@@ -307,6 +361,8 @@ def finalize_question_mission(mission_id: str) -> dict:
         db.close()
         return {"mission_id": mission_id, "status": "question_missing"}
 
+    from behive.engine.citation_auditor import audit_mission
+    citation_audit = audit_mission(mission_id, 100, only_unaudited=True)
     completeness = _score_question(db, question_id, mission_id)
     already_finalized = question[1] == mission_id and question[2] is not None
     question_status = completeness["status"]
@@ -317,6 +373,13 @@ def finalize_question_mission(mission_id: str) -> dict:
         [mission_id, question_status, completeness["score"], json.dumps(completeness),
          0 if already_finalized else 1, question_id],
     )
+    # A later citation audit may invalidate a finding promoted by an earlier
+    # run. Keep it in the ledger, but remove it from supported research output.
+    db.execute(
+        "UPDATE hive_findings f SET status='superseded' FROM hive_claims c "
+        "WHERE f.claim_id=c.id AND f.project_id=? AND COALESCE(c.is_garbage,FALSE)=TRUE "
+        "AND f.status<>'superseded'", [project_id],
+    )
     db.execute(
         "INSERT INTO hive_findings (project_id,question_id,claim_id,source_url,summary,confidence,novelty,status) "
         "SELECT ?,?,c.id,c.source_url,c.claim,c.confidence,COALESCE(c.quality_score,.5),'supported' "
@@ -325,7 +388,8 @@ def finalize_question_mission(mission_id: str) -> dict:
         [project_id, question_id, mission_id, question_id],
     )
     promoted = db.execute(
-        "SELECT COUNT(*) FROM hive_findings WHERE project_id=? AND question_id=?",
+        "SELECT COUNT(*) FROM hive_findings WHERE project_id=? AND question_id=? "
+        "AND status NOT IN ('contradicted','superseded')",
         [project_id, question_id],
     ).fetchone()[0]
     expanded = 0 if already_finalized else _expand_residual_unknowns(
@@ -346,6 +410,7 @@ def finalize_question_mission(mission_id: str) -> dict:
             "findings_promoted": int(promoted or 0), "new_questions": expanded,
             "paths_generated": paths.get("generated", 0),
             "paths_activated": activated.get("activated", 0),
+            "citation_audit": citation_audit,
             "actions_queued": queue.get("actions_queued", 0),
             "branches_synced": queue.get("branches_synced", 0)}
 
@@ -370,7 +435,8 @@ def _expand_residual_unknowns(db, project_id: str, question_id: str, question: s
         if not child: continue
         child_id = f"question_{sha1((question_id+'|'+gap).encode()).hexdigest()[:16]}"
         db.execute("INSERT INTO hive_questions (id,project_id,parent_id,question,depth,kind,priority,status) "
-                   "VALUES (?,?,?,?,?,'evidence gap',.85,'open') ON CONFLICT (id) DO NOTHING",
+                   "VALUES (?,?,?,?,?,'evidence gap',.98,'open') ON CONFLICT (id) DO UPDATE SET "
+                   "kind='evidence gap',priority=GREATEST(hive_questions.priority,.98)",
                    [child_id,project_id,question_id,child[:2000],depth+1])
         added += 1
     return added
@@ -414,6 +480,8 @@ def _research_question(mission_id: str, branch_id: str, action_id: int) -> dict:
          "--depth", "4", "--scale", "80", "--force"],
         capture_output=True, text=True, encoding="utf-8", errors="replace", env=env, timeout=1800,
     )
+    from behive.engine.citation_auditor import audit_mission
+    audit_result = audit_mission(child_id, 100, only_unaudited=True)
     db = connect()
     result = db.execute(
         "SELECT status,(SELECT COUNT(*) FROM hive_claims WHERE mission_id=?) FROM hive_missions WHERE id=?",
@@ -446,7 +514,7 @@ def _research_question(mission_id: str, branch_id: str, action_id: int) -> dict:
         raise RuntimeError(f"Question research worker exited {proc.returncode}: {proc.stdout[-600:]}")
     return {"child_mission_id": child_id, "question_id": question_id,
             "status": child_status, "claims": claims, "completeness": completeness,
-            "new_questions": expanded}
+            "new_questions": expanded, "citation_audit": audit_result}
 
 
 def compact_pending_queue(db, mission_id: str) -> dict:
@@ -522,8 +590,9 @@ def reconcile(mission_id: str, trigger: str = "controller") -> dict:
         if active:
             continue
         kind, rationale, metrics = _choose_action(branch)
-        score = round(.34*metrics["information_gain"] + .2*metrics["source_quality_gain"] +
-                      .18*metrics["novelty"] + .18*metrics["feasibility"] + .1*(1-metrics["cost"]), 4)
+        score = round(.29*metrics["information_gain"] + .16*metrics["source_quality_gain"] +
+                      .15*metrics["novelty"] + .15*metrics["feasibility"] + .1*(1-metrics["cost"]) +
+                      .15*float(priority or .5), 4)
         fingerprint = _fingerprint(bid, kind, int(generation))
         db.execute(
             """INSERT INTO hive_research_actions

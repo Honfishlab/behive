@@ -314,7 +314,8 @@ def project_workspace(project_id: str):
         cur.execute(
             "SELECT DISTINCT COALESCE(f.source_url,c.source_url),c.claim,f.confidence,f.created_at "
             "FROM hive_findings f LEFT JOIN hive_claims c ON c.id=f.claim_id "
-            "WHERE f.project_id=%s AND COALESCE(f.source_url,c.source_url) IS NOT NULL ORDER BY f.created_at DESC",
+            "WHERE f.project_id=%s AND f.status NOT IN ('contradicted','superseded') "
+            "AND COALESCE(f.source_url,c.source_url) IS NOT NULL ORDER BY f.created_at DESC",
             (project_id,),
         )
         sources = cur.fetchall()
@@ -404,7 +405,7 @@ def project_map(project_id: str):
         cur.execute(
             "SELECT f.id,f.question_id,f.claim_id,f.summary,f.confidence,f.novelty,f.status,c.source_url "
             "FROM hive_findings f LEFT JOIN hive_claims c ON c.id=f.claim_id "
-            "WHERE f.project_id=%s ORDER BY f.created_at DESC",
+            "WHERE f.project_id=%s AND f.status NOT IN ('contradicted','superseded') ORDER BY f.created_at DESC",
             (project_id,),
         )
         findings = cur.fetchall()
