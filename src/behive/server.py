@@ -176,7 +176,7 @@ async def _continuous_discovery_loop():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan — check DB connectivity on startup."""
-    print("🐝 BeHive API starting...")
+    print("BeHive API starting...")
     # Validate DB connection at startup (non-fatal — API still serves /health as degraded)
     try:
         conn = get_db()
@@ -185,13 +185,13 @@ async def lifespan(app: FastAPI):
         conn.close()
         from behive.engine.controller import ensure_schema as ensure_controller_schema
         await asyncio.to_thread(ensure_controller_schema)
-        print("✅ PostgreSQL connected")
+        print("PostgreSQL connected")
     except RuntimeError as e:
-        print(f"⚠️  Database not available: {e}")
+        print(f"Database not available: {e}")
         print("   The API will start but /research will fail until DB is configured.")
         print("   Run: behive init-db")
     except Exception as e:
-        print(f"⚠️  Database check failed: {e}")
+        print(f"Database check failed: {e}")
     global _continuous_discovery_task
     _continuous_discovery_task = asyncio.create_task(_continuous_discovery_loop())
     yield
@@ -199,7 +199,7 @@ async def lifespan(app: FastAPI):
         _continuous_discovery_task.cancel()
         with suppress(asyncio.CancelledError):
             await _continuous_discovery_task
-    print("🐝 BeHive API shutdown.")
+    print("BeHive API shutdown.")
 
 
 app = FastAPI(
