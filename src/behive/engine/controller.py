@@ -201,10 +201,11 @@ def _score_question(db, question_id: str, mission_id: str | None) -> dict:
                 "direct": 0, "contradictions": 0, "status": "queued", "gaps": ["No research mission has run"]}
     row = db.execute(
         "SELECT COUNT(*),COUNT(*) FILTER (WHERE integrity_status='supported'),"
-        "COUNT(DISTINCT source_url),COUNT(DISTINCT NULLIF(split_part(regexp_replace(source_url,'^https?://',''),'/',1),'')),"
+        "COUNT(DISTINCT source_url),COUNT(DISTINCT NULLIF(split_part(split_part(source_url,'://',2),'/',1),'')),"
         "COUNT(*) FILTER (WHERE COALESCE(quality_details->>'evidence_class','')='direct'),"
-        "COUNT(*) FILTER (WHERE claim_type ILIKE '%contradict%') "
-        "FROM hive_claims WHERE mission_id=? AND COALESCE(is_garbage,FALSE)=FALSE", [mission_id]
+        "COUNT(*) FILTER (WHERE claim_type ILIKE ?) "
+        "FROM hive_claims WHERE mission_id=? AND COALESCE(is_garbage,FALSE)=FALSE",
+        ["%contradict%", mission_id]
     ).fetchone()
     findings, audited, sources, domains, direct, contradictions = [int(v or 0) for v in row]
     audit_ratio = audited / findings if findings else 0
@@ -240,6 +241,68 @@ def _propagate_question_state(db, question_id: str) -> None:
                    [parent_status, aggregate, json.dumps({"child_coverage": aggregate,"children_covered": covered,
                     "children_total": len(rows)}), parent_id])
         current = parent_id
+
+
+def finalize_question_mission(mission_id: str) -> dict:
+    """Attach a terminal mission to its question and seed follow-up work.
+
+    This is deliberately idempotent: API completion, recovery, and startup
+    reconciliation may all call it without duplicating project findings or
+    incrementing a question's attempt count more than once per mission.
+    """
+    db = connect(); ensure_schema(db)
+    row = db.execute(
+        "SELECT project_id,question_id,status FROM hive_missions WHERE id=?", [mission_id]
+    ).fetchone()
+    if not row or not row[0] or not row[1]:
+        db.close()
+        return {"mission_id": mission_id, "status": "not_linked"}
+    project_id, question_id, mission_status = row
+    if mission_status not in ("done", "insufficient"):
+        db.close()
+        return {"mission_id": mission_id, "status": "not_terminal"}
+    question = db.execute(
+        "SELECT question,mission_id,last_researched_at FROM hive_questions "
+        "WHERE id=? AND project_id=?", [question_id, project_id]
+    ).fetchone()
+    if not question:
+        db.close()
+        return {"mission_id": mission_id, "status": "question_missing"}
+
+    completeness = _score_question(db, question_id, mission_id)
+    already_finalized = question[1] == mission_id and question[2] is not None
+    question_status = completeness["status"]
+    db.execute(
+        "UPDATE hive_questions SET mission_id=?,status=?,confidence=?,"
+        "evidence_completeness=?::jsonb,attempts=attempts+?,last_researched_at=NOW(),"
+        "updated_at=NOW() WHERE id=?",
+        [mission_id, question_status, completeness["score"], json.dumps(completeness),
+         0 if already_finalized else 1, question_id],
+    )
+    db.execute(
+        "INSERT INTO hive_findings (project_id,question_id,claim_id,source_url,summary,confidence,novelty,status) "
+        "SELECT ?,?,c.id,c.source_url,c.claim,c.confidence,COALESCE(c.quality_score,.5),'supported' "
+        "FROM hive_claims c WHERE c.mission_id=? AND COALESCE(c.is_garbage,FALSE)=FALSE "
+        "AND NOT EXISTS (SELECT 1 FROM hive_findings f WHERE f.question_id=? AND f.claim_id=c.id)",
+        [project_id, question_id, mission_id, question_id],
+    )
+    promoted = db.execute(
+        "SELECT COUNT(*) FROM hive_findings WHERE project_id=? AND question_id=?",
+        [project_id, question_id],
+    ).fetchone()[0]
+    expanded = 0 if already_finalized else _expand_residual_unknowns(
+        db, project_id, question_id, question[0], completeness
+    )
+    _propagate_question_state(db, question_id)
+    db.commit(); db.close()
+
+    # Reconciliation creates durable branches/actions for every open question.
+    queue = reconcile(mission_id, trigger="mission_complete")
+    return {"mission_id": mission_id, "status": "finalized", "project_id": project_id,
+            "question_id": question_id, "question_status": question_status,
+            "findings_promoted": int(promoted or 0), "new_questions": expanded,
+            "actions_queued": queue.get("actions_queued", 0),
+            "branches_synced": queue.get("branches_synced", 0)}
 
 
 def _expand_residual_unknowns(db, project_id: str, question_id: str, question: str, completeness: dict) -> int:

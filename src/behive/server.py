@@ -1913,6 +1913,28 @@ async def _run_pipeline_inner(mission_id: str, topic: str, depth: int):
         conn.commit()
         conn.close()
 
+        if proc.returncode == 0:
+            try:
+                from behive.engine.controller import finalize_question_mission
+                handoff = await asyncio.to_thread(finalize_question_mission, mission_id)
+                _emit_event(mission_id, "controller", {"state": "handoff", **handoff})
+                if handoff.get("status") == "finalized":
+                    conn = get_db(); cur = conn.cursor()
+                    cur.execute(
+                        "SELECT COALESCE(p.agent_policy->>'status','paused'),"
+                        "COALESCE(p.agent_policy->>'autonomy','assisted') "
+                        "FROM hive_projects p JOIN hive_missions m ON m.project_id=p.id WHERE m.id=%s",
+                        (mission_id,),
+                    )
+                    policy = cur.fetchone(); conn.close()
+                    if policy and policy[0] == "running" and policy[1] == "continuous":
+                        _frontier_tasks[mission_id] = asyncio.create_task(
+                            _run_controller_background(mission_id, "mission_complete")
+                        )
+            except Exception as handoff_error:
+                _emit_event(mission_id, "controller", {"state": "handoff_failed",
+                            "message": str(handoff_error), "recoverable": True})
+
     except Exception as e:
         _mission_runtime.setdefault(mission_id, {})["error"] = str(e)
         _mission_runtime[mission_id]["last_output_at"] = time.time()
