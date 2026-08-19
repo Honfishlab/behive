@@ -296,11 +296,18 @@ def finalize_question_mission(mission_id: str) -> dict:
     _propagate_question_state(db, question_id)
     db.commit(); db.close()
 
+    # Findings become bounded, typed research paths. Continuous policy promotes
+    # only the highest-value paths into executable question-tree branches.
+    from behive.engine.discovery_paths import generate_paths, activate_ranked
+    paths = generate_paths(mission_id, project_id)
+    activated = activate_ranked(mission_id, limit=3, require_continuous=True)
     # Reconciliation creates durable branches/actions for every open question.
     queue = reconcile(mission_id, trigger="mission_complete")
     return {"mission_id": mission_id, "status": "finalized", "project_id": project_id,
             "question_id": question_id, "question_status": question_status,
             "findings_promoted": int(promoted or 0), "new_questions": expanded,
+            "paths_generated": paths.get("generated", 0),
+            "paths_activated": activated.get("activated", 0),
             "actions_queued": queue.get("actions_queued", 0),
             "branches_synced": queue.get("branches_synced", 0)}
 
@@ -393,6 +400,8 @@ def _research_question(mission_id: str, branch_id: str, action_id: int) -> dict:
     _propagate_question_state(db, question_id)
     db.commit()
     db.close()
+    from behive.engine.discovery_paths import sync_path_states
+    sync_path_states(project_id)
     if proc.returncode != 0:
         raise RuntimeError(f"Question research worker exited {proc.returncode}: {proc.stdout[-600:]}")
     return {"child_mission_id": child_id, "question_id": question_id,

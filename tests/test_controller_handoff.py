@@ -1,6 +1,7 @@
 from unittest.mock import patch
 
 from behive.engine import controller
+from behive.engine import discovery_paths
 
 
 class Result:
@@ -45,6 +46,8 @@ def test_finalize_question_mission_promotes_and_seeds_queue():
          patch.object(controller, "_score_question", return_value=completeness), \
          patch.object(controller, "_expand_residual_unknowns", return_value=0), \
          patch.object(controller, "_propagate_question_state"), \
+         patch.object(discovery_paths, "generate_paths", return_value={"generated": 2}), \
+         patch.object(discovery_paths, "activate_ranked", return_value={"activated": 1}), \
          patch.object(controller, "reconcile", return_value=queue):
         result = controller.finalize_question_mission("mission_1")
 
@@ -64,6 +67,8 @@ def test_finalize_question_mission_is_idempotent_per_question_mission():
          patch.object(controller, "_score_question", return_value=completeness), \
          patch.object(controller, "_expand_residual_unknowns") as expand, \
          patch.object(controller, "_propagate_question_state"), \
+         patch.object(discovery_paths, "generate_paths", return_value={"generated": 0}), \
+         patch.object(discovery_paths, "activate_ranked", return_value={"activated": 0}), \
          patch.object(controller, "reconcile", return_value={}):
         controller.finalize_question_mission("mission_1")
 

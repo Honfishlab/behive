@@ -185,6 +185,8 @@ async def lifespan(app: FastAPI):
         conn.close()
         from behive.engine.controller import ensure_schema as ensure_controller_schema
         await asyncio.to_thread(ensure_controller_schema)
+        from behive.engine.discovery_paths import ensure_schema as ensure_discovery_path_schema
+        await asyncio.to_thread(ensure_discovery_path_schema)
         print("PostgreSQL connected")
     except RuntimeError as e:
         print(f"Database not available: {e}")
@@ -328,6 +330,10 @@ class CopilotActionRequest(BaseModel):
     action_type: str = Field(..., pattern="^(add_question|start_controller|external_search)$")
     question: str | None = Field(default=None, max_length=2000)
     parent_id: str | None = None
+
+
+class DiscoveryPathAction(BaseModel):
+    action: str = Field(pattern="^(activate|defer|resume|resolve)$")
 
 
 class BoundaryResearchRequest(BaseModel):
@@ -973,6 +979,46 @@ async def continuous_controller_state(mission_id: str):
     try:
         from behive.engine.controller import get_controller_state
         return await asyncio.to_thread(get_controller_state, mission_id)
+    except Exception as exc:
+        raise HTTPException(500, str(exc))
+
+
+@app.get("/research/{mission_id}/discovery-paths")
+async def discovery_path_state(mission_id: str):
+    """Return finding-linked paths, competing explanations, and ranked plans."""
+    try:
+        from behive.engine.discovery_paths import get_paths
+        return await asyncio.to_thread(get_paths, mission_id)
+    except Exception as exc:
+        raise HTTPException(500, str(exc))
+
+
+@app.post("/research/{mission_id}/discovery-paths/generate")
+async def generate_discovery_paths(mission_id: str):
+    """Generate bounded research paths from this mission's promoted findings."""
+    try:
+        from behive.engine.discovery_paths import generate_paths, activate_ranked
+        generated = await asyncio.to_thread(generate_paths, mission_id)
+        activated = await asyncio.to_thread(activate_ranked, mission_id, 3, True)
+        from behive.engine.controller import reconcile
+        queued = await asyncio.to_thread(reconcile, mission_id, "finding_to_path")
+        return {**generated, **activated, "queue": queued}
+    except Exception as exc:
+        raise HTTPException(500, str(exc))
+
+
+@app.post("/research/{mission_id}/discovery-paths/{path_id}/actions")
+async def discovery_path_control(mission_id: str, path_id: str, body: DiscoveryPathAction):
+    """Activate, defer, resume, or resolve a discovery path."""
+    try:
+        from behive.engine.discovery_paths import control_path
+        result = await asyncio.to_thread(control_path, path_id, body.action)
+        if body.action in ("activate", "resume"):
+            from behive.engine.controller import reconcile
+            result["queue"] = await asyncio.to_thread(reconcile, mission_id, "path_control")
+        return result
+    except ValueError as exc:
+        raise HTTPException(404, str(exc))
     except Exception as exc:
         raise HTTPException(500, str(exc))
 
