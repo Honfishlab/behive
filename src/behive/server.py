@@ -142,6 +142,7 @@ async def _continuous_discovery_loop():
             cur.execute("""
                 SELECT DISTINCT ON (p.id) m.id,p.cadence_minutes
                 FROM hive_projects p JOIN hive_missions m ON m.project_id=p.id
+                JOIN hive_questions rootq ON rootq.id=m.question_id AND rootq.parent_id IS NULL
                 WHERE COALESCE(p.agent_policy->>'autonomy','assisted')='continuous'
                   AND COALESCE(p.agent_policy->>'status','paused')='running'
                   AND m.status IN ('done','insufficient')

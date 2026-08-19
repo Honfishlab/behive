@@ -93,3 +93,43 @@ def test_question_score_sql_does_not_confuse_adapter_placeholders():
 
     score = controller._score_question(ScoreDB(), "question_1", "mission_1")
     assert score["status"] == "covered"
+
+
+def test_child_mission_resolves_to_root_controller_anchor():
+    class AnchorDB:
+        def execute(self, sql, params=None):
+            if "SELECT m.project_id,q.parent_id" in sql:
+                return Result(("project_1", "root_question"))
+            if "q.parent_id IS NULL" in sql:
+                return Result(("root_mission",))
+            raise AssertionError(sql)
+
+    assert controller._controller_anchor(AnchorDB(), "child_mission") == "root_mission"
+
+
+def test_root_mission_remains_its_own_controller_anchor():
+    class RootDB:
+        def execute(self, sql, params=None):
+            return Result(("project_1", None))
+
+    assert controller._controller_anchor(RootDB(), "root_mission") == "root_mission"
+
+
+def test_question_sync_does_not_reactivate_evidence_found():
+    class SyncDB:
+        def execute(self, sql, params=None):
+            normalized = " ".join(sql.split())
+            if normalized.startswith("SELECT project_id FROM hive_missions"):
+                return Result(("project_1",))
+            if normalized.startswith("SELECT id,question,priority"):
+                assert "'evidence_found'" not in normalized
+                return QueryResult([])
+            if normalized.startswith("SELECT id,title,frontier_type"):
+                return QueryResult([])
+            return Result()
+
+    class QueryResult(Result):
+        def fetchall(self):
+            return self.row
+
+    assert controller._sync_branches(SyncDB(), "root_mission") == 0

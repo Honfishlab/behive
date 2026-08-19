@@ -84,6 +84,40 @@ def _branch_id(mission_id: str, subject_type: str, subject_id: str) -> str:
     return f"rb_{sha1(raw).hexdigest()[:20]}"
 
 
+def _controller_anchor(db, mission_id: str) -> str:
+    """Return the single root-question mission that owns a project's queue."""
+    row = db.execute(
+        "SELECT m.project_id,q.parent_id FROM hive_missions m "
+        "LEFT JOIN hive_questions q ON q.id=m.question_id WHERE m.id=?", [mission_id]
+    ).fetchone()
+    if not row or not row[0] or row[1] is None:
+        return mission_id
+    anchor = db.execute(
+        "SELECT m.id FROM hive_missions m JOIN hive_questions q ON q.id=m.question_id "
+        "WHERE m.project_id=? AND q.parent_id IS NULL ORDER BY m.created_at DESC LIMIT 1",
+        [row[0]],
+    ).fetchone()
+    return anchor[0] if anchor else mission_id
+
+
+def _retire_child_controllers(db, mission_id: str) -> None:
+    """Supersede recursive queues accidentally created under child missions."""
+    project = db.execute("SELECT project_id FROM hive_missions WHERE id=?", [mission_id]).fetchone()
+    if not project or not project[0]: return
+    db.execute(
+        "UPDATE hive_research_actions SET status='superseded',completed_at=NOW(),"
+        "error_message='Retired: project queue is owned by root mission' "
+        "WHERE mission_id<>? AND mission_id IN (SELECT id FROM hive_missions WHERE project_id=?) "
+        "AND status IN ('queued','running','retrying')", [mission_id,project[0]],
+    )
+    db.execute(
+        "UPDATE hive_research_branches SET status='satisfied',updated_at=NOW() "
+        "WHERE mission_id<>? AND mission_id IN (SELECT id FROM hive_missions WHERE project_id=?) "
+        "AND status IN ('watching','searching','retrieving','extracting','verifying','hypothesis_testing','blocked')",
+        [mission_id,project[0]],
+    )
+
+
 def _fingerprint(branch_id: str, action_type: str, generation: int) -> str:
     return sha1(f"{branch_id}|{action_type}|{generation}".encode()).hexdigest()[:24]
 
@@ -125,9 +159,13 @@ def _sync_branches(db, mission_id: str) -> int:
             "AND b.status='satisfied' AND a.status IN ('queued','retrying')",
             [mission_id],
         )
+    # evidence_found is terminal for this exact question attempt. Any explicit
+    # evidence gaps have already been expanded into their own child questions;
+    # reactivating the parent here causes duplicate missions and starves them.
     questions = db.execute(
         "SELECT id,question,priority,confidence,status FROM hive_questions WHERE project_id=? "
-        "AND status IN ('open','queued','researching','blocked','evidence_boundary') ORDER BY priority DESC,depth,id",
+        "AND status IN ('open','queued','researching','blocked','evidence_boundary') "
+        "ORDER BY priority DESC,depth,id",
         [project_id],
     ).fetchall() if project_id else []
     synced = 0
@@ -382,6 +420,8 @@ def _research_question(mission_id: str, branch_id: str, action_id: int) -> dict:
         [child_id, child_id],
     ).fetchone() or ("error", 0)
     child_status, claims = result
+    if child_status in ("done", "insufficient", "error", "cancelled", "interrupted"):
+        db.execute("UPDATE hive_missions SET phase=? WHERE id=?", [child_status, child_id])
     completeness = _score_question(db, question_id, child_id)
     question_status = completeness["status"] if child_status in ("done", "insufficient") else "blocked"
     db.execute(
@@ -431,6 +471,8 @@ def compact_pending_queue(db, mission_id: str) -> dict:
 def reconcile(mission_id: str, trigger: str = "controller") -> dict:
     """Synchronize branches, record graph changes, and queue ranked actions."""
     db = connect(); ensure_schema(db)
+    mission_id = _controller_anchor(db, mission_id)
+    _retire_child_controllers(db, mission_id)
     before_row = db.execute(
         "SELECT after_state FROM hive_research_changes WHERE mission_id=? AND change_type='snapshot' "
         "ORDER BY id DESC LIMIT 1", [mission_id]
@@ -568,6 +610,9 @@ def _run_next_action_locked(mission_id: str, trigger: str = "continuous") -> dic
 
 def run_next_action(mission_id: str, trigger: str = "continuous") -> dict:
     """Execute at most one action across every Behive server sharing PostgreSQL."""
+    anchor_db = connect()
+    mission_id = _controller_anchor(anchor_db, mission_id)
+    anchor_db.close()
     lease_db = connect()
     acquired = lease_db.execute(
         "SELECT pg_try_advisory_lock(hashtextextended(?,0))", [f"behive-controller:{mission_id}"]
@@ -590,6 +635,7 @@ def get_controller_state(mission_id: str) -> dict:
     # Dashboard reads must never create branches or queue actions.
     ensure_schema()
     db = connect()
+    mission_id = _controller_anchor(db, mission_id)
     branches = db.execute(
         "SELECT id,subject_type,subject_id,title,status,reason,uncertainty,evidence_coverage,priority,retry_count,"
         "duplicate_streak,no_progress_cycles,last_action,last_checked_at,next_review_at FROM hive_research_branches "
