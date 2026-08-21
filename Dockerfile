@@ -34,13 +34,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copy installed packages from builder
 COPY --from=builder /install /usr/local
 
-# Copy application
-COPY . .
-
-# Install the behive package + Playwright browsers
-RUN pip install --no-cache-dir -e . && \
-    pip install --no-cache-dir playwright && \
+# Install Playwright browsers in a dependency-only layer so source edits do
+# not force a several-hundred-megabyte browser download on every rebuild.
+RUN pip install --no-cache-dir playwright && \
     playwright install chromium --with-deps 2>/dev/null || true
+
+# Copy and install the application after stable runtime dependencies.
+COPY . .
+RUN pip install --no-cache-dir -e .
 
 # Create data directories
 RUN mkdir -p /data/reports /data/cache && chown -R behive:behive /app /data

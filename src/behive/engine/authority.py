@@ -23,6 +23,15 @@ def _get(url: str, accept: str = "application/json", timeout: int = 20) -> str:
         return response.read().decode("utf-8", errors="replace")
 
 
+def _post_json(url: str, payload: dict, timeout: int = 25) -> dict:
+    request = urllib.request.Request(
+        url, data=json.dumps(payload).encode("utf-8"), method="POST",
+        headers={"User-Agent": AGENT, "Accept": "application/json", "Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8", errors="replace"))
+
+
 def _plain(value: str | None) -> str:
     value = html.unescape(value or "")
     value = re.sub(r"<[^>]+>", " ", value)
@@ -148,12 +157,117 @@ def _crossref(mission_id: str, topic: str, db, limit: int) -> dict:
     return {"registry": "crossref", "found": len(results), "saved": saved}
 
 
-def ingest_authority_sources(mission_id: str, topic: str, limit: int = 25) -> dict:
+def _pubmed(mission_id: str, topic: str, db, limit: int) -> dict:
+    params = urllib.parse.urlencode({"db":"pubmed","term":topic,"retmode":"json","retmax":limit,"sort":"relevance"})
+    ids = json.loads(_get(f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?{params}"))\
+        .get("esearchresult", {}).get("idlist", [])
+    if not ids: return {"registry":"pubmed","found":0,"saved":0}
+    xml = _get("https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?" + urllib.parse.urlencode(
+        {"db":"pubmed","id":",".join(ids),"retmode":"xml"}), "application/xml")
+    root = ET.fromstring(xml); saved = 0
+    for article in root.findall(".//PubmedArticle"):
+        pmid = _plain(article.findtext(".//PMID")); title = _xml_text(ET.tostring(article.find(".//ArticleTitle"), encoding="unicode")) if article.find(".//ArticleTitle") is not None else pmid
+        abstract = " ".join(_plain("".join(x.itertext())) for x in article.findall(".//AbstractText"))
+        if not pmid or not title: continue
+        publication_types = [_plain(x.text) for x in article.findall(".//PublicationType")]
+        provenance={"registry":"PubMed","pmid":pmid,"journal":_plain(article.findtext(".//Journal/Title")),
+                    "published":_plain(article.findtext(".//PubDate/Year")),"publication_types":publication_types}
+        if _save(db,mission_id,url=f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/",title=title,abstract=abstract,
+                 source_type="scholarly_primary",method="pubmed_abstract",persistent_id=f"PMID:{pmid}",tier=1,
+                 authority=20,open_access=None,primary=not any("Review" in x for x in publication_types),
+                 provenance=provenance,content=abstract): saved += 1
+    return {"registry":"pubmed","found":len(ids),"saved":saved}
+
+
+def _clinical_trials(mission_id: str, topic: str, db, limit: int) -> dict:
+    params=urllib.parse.urlencode({"query.term":topic,"pageSize":min(limit,100),"format":"json"})
+    studies=json.loads(_get(f"https://clinicaltrials.gov/api/v2/studies?{params}")) .get("studies",[])
+    saved=0
+    for study in studies:
+        protocol=study.get("protocolSection",{}); identification=protocol.get("identificationModule",{})
+        nct=identification.get("nctId"); title=identification.get("briefTitle") or identification.get("officialTitle")
+        if not nct or not title: continue
+        design=protocol.get("designModule",{}); status=protocol.get("statusModule",{}); outcomes=protocol.get("outcomesModule",{})
+        content=" ".join(filter(None,[title,identification.get("officialTitle"),
+            (protocol.get("descriptionModule",{}) or {}).get("briefSummary"),
+            json.dumps(design,default=str),json.dumps(outcomes,default=str)]))
+        provenance={"registry":"ClinicalTrials.gov","nct_id":nct,"overall_status":status.get("overallStatus"),
+                    "study_type":design.get("studyType"),"phases":design.get("phases") or []}
+        if _save(db,mission_id,url=f"https://clinicaltrials.gov/study/{nct}",title=title,abstract=content[:4000],
+                 source_type="clinical_trial_registry",method="clinicaltrials_v2",persistent_id=f"NCT:{nct}",
+                 tier=1,authority=20,open_access=True,primary=True,provenance=provenance,content=content): saved+=1
+    return {"registry":"clinicaltrials.gov","found":len(studies),"saved":saved}
+
+
+def _openalex(mission_id: str, topic: str, db, limit: int) -> dict:
+    params={"search":topic,"per-page":min(limit,50),"select":"id,doi,title,publication_year,type,authorships,primary_location,cited_by_count,open_access"}
+    results=json.loads(_get("https://api.openalex.org/works?"+urllib.parse.urlencode(params))).get("results",[]); saved=0
+    for item in results:
+        oid=str(item.get("id") or "").rsplit("/",1)[-1]; title=item.get("title"); doi=item.get("doi")
+        if not oid or not title: continue
+        location=item.get("primary_location") or {}; landing=location.get("landing_page_url") or doi or item.get("id")
+        authors=", ".join((a.get("author") or {}).get("display_name","") for a in item.get("authorships") or [])
+        provenance={"registry":"OpenAlex","openalex_id":oid,"doi":doi,"published":item.get("publication_year"),
+                    "type":item.get("type"),"authors":authors,"cited_by_count":item.get("cited_by_count"),
+                    "open_access":item.get("open_access") or {}}
+        if _save(db,mission_id,url=landing,title=title,abstract=title,source_type="scholarly_citation_index",
+                 method="openalex_index",persistent_id=f"OPENALEX:{oid}",tier=2,authority=17,
+                 open_access=(item.get("open_access") or {}).get("is_oa"),primary=None,provenance=provenance): saved+=1
+    return {"registry":"openalex","found":len(results),"saved":saved}
+
+
+def _geo(mission_id: str, topic: str, db, limit: int) -> dict:
+    params=urllib.parse.urlencode({"db":"gds","term":topic,"retmode":"json","retmax":limit,"sort":"relevance"})
+    ids=json.loads(_get(f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?{params}"))\
+        .get("esearchresult",{}).get("idlist",[])
+    if not ids: return {"registry":"ncbi_geo","found":0,"saved":0}
+    summary=json.loads(_get("https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi?"+urllib.parse.urlencode(
+        {"db":"gds","id":",".join(ids),"retmode":"json"}))).get("result",{}); saved=0
+    for uid in ids:
+        item=summary.get(uid) or {}; accession=item.get("accession"); title=item.get("title")
+        if not accession or not title: continue
+        content=" ".join(filter(None,[title,item.get("summary"),item.get("overall_design"),item.get("organism")]))
+        provenance={"registry":"NCBI GEO","accession":accession,"organism":item.get("taxon"),
+                    "samples":item.get("n_samples"),"published":item.get("pdat")}
+        if _save(db,mission_id,url=f"https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc={accession}",title=title,
+                 abstract=content,source_type="experimental_dataset",method="ncbi_geo",persistent_id=f"GEO:{accession}",
+                 tier=1,authority=20,open_access=True,primary=True,provenance=provenance,content=content): saved+=1
+    return {"registry":"ncbi_geo","found":len(ids),"saved":saved}
+
+
+def _nih_reporter(mission_id: str, topic: str, db, limit: int) -> dict:
+    words=[x for x in re.findall(r"[A-Za-z0-9-]{3,}",topic) if x.lower() not in {"study","studies","research","effect","effects"}][:12]
+    data=_post_json("https://api.reporter.nih.gov/v2/projects/search",{"criteria":{"advanced_text_search":{"operator":"and","search_field":"all","search_text":" ".join(words)}},"offset":0,"limit":min(limit,25)})
+    results=data.get("results") or []; saved=0
+    for item in results:
+        project_num=item.get("project_num") or item.get("core_project_num"); title=item.get("project_title")
+        if not project_num or not title: continue
+        content=" ".join(filter(None,[title,item.get("abstract_text"),item.get("terms")]))
+        org=item.get("organization") or {}; provenance={"registry":"NIH RePORTER","project_num":project_num,
+            "fiscal_year":item.get("fiscal_year"),"organization":org.get("org_name"),"principal_investigators":item.get("principal_investigators") or []}
+        if _save(db,mission_id,url=f"https://reporter.nih.gov/project-details/{urllib.parse.quote(str(item.get('appl_id') or project_num))}",
+                 title=title,abstract=content[:4000],source_type="funded_research_registry",method="nih_reporter",
+                 persistent_id=f"NIH:{project_num}",tier=2,authority=19,open_access=True,primary=False,
+                 provenance=provenance,content=content): saved+=1
+    return {"registry":"nih_reporter","found":len(results),"saved":saved}
+
+
+def ingest_authority_sources(mission_id: str, topic: str, limit: int = 25, source_family: str | None = None) -> dict:
     """Ingest registry-verified records and usable text before broad web discovery."""
     db = connect()
     _ensure_schema(db)
+    routes={
+        "primary_study": (("Europe PMC",_europe_pmc),("PubMed",_pubmed)),
+        "dataset": (("NCBI GEO",_geo),("OpenAlex",_openalex),("Europe PMC",_europe_pmc)),
+        "registry": (("ClinicalTrials.gov",_clinical_trials),("NIH RePORTER",_nih_reporter),("PubMed",_pubmed)),
+        "regulatory": (("ClinicalTrials.gov",_clinical_trials),("NIH RePORTER",_nih_reporter)),
+        "thesis": (("OpenAlex",_openalex),("Crossref",_crossref)),
+        "multilingual": (("Europe PMC",_europe_pmc),("OpenAlex",_openalex)),
+        "patent": (("Crossref",_crossref),("OpenAlex",_openalex)),
+    }
+    selected=routes.get(source_family) or (("Europe PMC",_europe_pmc),("Crossref",_crossref),("PubMed",_pubmed),("OpenAlex",_openalex))
     reports, errors = [], []
-    for name, function in (("Europe PMC", _europe_pmc), ("Crossref", _crossref)):
+    for name, function in selected:
         try:
             reports.append(function(mission_id, topic, db, limit))
         except Exception as exc:
@@ -165,5 +279,5 @@ def ingest_authority_sources(mission_id: str, topic: str, limit: int = 25) -> di
            FROM hive_sources WHERE mission_id=? AND verification_status='registry_verified'""", [mission_id]
     ).fetchone()
     db.close()
-    return {"registries": reports, "errors": errors, "verified_sources": counts[0],
-            "evidence_ready": counts[1], "tier_one": counts[2]}
+    return {"source_family":source_family or "general","registries": reports, "errors": errors,
+            "verified_sources": counts[0],"evidence_ready": counts[1], "tier_one": counts[2]}
