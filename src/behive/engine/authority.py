@@ -40,9 +40,9 @@ def _plain(value: str | None) -> str:
 
 _QUERY_STOPWORDS = {
     "about", "after", "against", "among", "and", "are", "benefit", "benefits",
-    "boosting", "could", "does", "effect", "effects", "for", "from", "have",
+    "boosting", "complementary", "could", "does", "effect", "effects", "for", "from", "have",
     "how", "into", "levels", "other", "reduce", "reducing", "research", "the",
-    "their", "these", "this", "what", "when", "where", "which", "with",
+    "their", "therapies", "therapy", "these", "this", "what", "when", "where", "which", "with",
 }
 
 

@@ -741,10 +741,12 @@ async def get_research_evidence(mission_id: str):
     try:
         conn = get_db()
         cur = conn.cursor()
-        cur.execute("SELECT 1 FROM hive_missions WHERE id=%s", (mission_id,))
-        if not cur.fetchone():
+        cur.execute("SELECT topic FROM hive_missions WHERE id=%s", (mission_id,))
+        mission_row = cur.fetchone()
+        if not mission_row:
             conn.close()
             raise HTTPException(404, f"Mission {mission_id} not found")
+        mission_topic = mission_row[0] or ""
         cur.execute("""
             SELECT c.title, c.url, c.domain, c.word_count, c.harvest_method,
                    c.quality_score, c.author, c.published_date, c.harvested_at,
@@ -761,7 +763,7 @@ async def get_research_evidence(mission_id: str):
             ORDER BY COUNT(cl.id) DESC, c.quality_score DESC, c.harvested_at DESC
             LIMIT 500
         """, (mission_id,))
-        library = [{"title": r[0] or r[2] or r[1], "url": r[1], "domain": r[2] or "",
+        all_documents = [{"title": r[0] or r[2] or r[1], "url": r[1], "domain": r[2] or "",
                     "word_count": r[3] or 0, "harvest_method": r[4] or "unknown",
                     "quality_score": float(r[5] or 0), "author": r[6] or "",
                     "published_date": r[7] or "", "harvested_at": r[8].isoformat() if r[8] else "",
@@ -769,6 +771,10 @@ async def get_research_evidence(mission_id: str):
                     "verification_status": r[11] or "unverified", "persistent_id": r[12] or "",
                     "is_primary": bool(r[13]), "is_open_access": bool(r[14])} for r in cur.fetchall()]
         conn.close()
+        from behive.engine.authority import _is_relevant
+        library = [item for item in all_documents
+                   if item["claim_count"] > 0 or _is_relevant(mission_topic, item["title"])]
+        quarantined = len(all_documents) - len(library)
         bibliography = [{"number": i + 1, "title": item["title"], "url": item["url"],
                          "domain": item["domain"], "author": item["author"],
                          "published_date": item["published_date"], "accessed_at": item["harvested_at"],
@@ -776,10 +782,13 @@ async def get_research_evidence(mission_id: str):
                          "verification_status": item["verification_status"],
                          "persistent_id": item["persistent_id"], "is_primary": item["is_primary"]}
                         for i, item in enumerate(library)]
-        return {"mission_id": mission_id, "library": library, "bibliography": bibliography,
+        return {"mission_id": mission_id, "mission_topic": mission_topic,
+                "library": library, "bibliography": bibliography,
                 "metrics": {"documents": len(library), "cited_sources": sum(x["claim_count"] > 0 for x in library),
                             "registry_verified": sum(x["verification_status"] == "registry_verified" for x in library),
-                            "tier_one": sum(x["evidence_tier"] == 1 for x in library)}}
+                            "tier_one": sum(x["evidence_tier"] == 1 for x in library),
+                            "quarantined_irrelevant": quarantined,
+                            "documents_examined": len(all_documents)}}
     except HTTPException:
         raise
     except Exception as e:
