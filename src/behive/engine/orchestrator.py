@@ -1555,7 +1555,7 @@ def cmd_run(topic: str, think: bool = False, deep: bool = False, force: bool = F
     
     # Cleanup zombie missions from previous crashed runs
     try:
-        cleaned = cleanup_stuck_missions(max_age_hours=1)
+        cleaned = cleanup_stuck_missions(max_age_hours=1, exclude_mission_id=mission_id)
         if cleaned > 0:
             log.info(f"  🧹  Cleaned {cleaned} stuck missions from previous runs")
     except Exception:
@@ -1730,6 +1730,23 @@ def _run_pipeline_phases(mission_id: str, topic: str, plan: list, timings: dict,
             _backoff = 10 * (scout_attempt + 1)  # 10s, 20s
             log.warning(f'  ⚠️  Scout returned 0 sources — retrying in {_backoff}s (attempt {scout_attempt+1}/{_max_scout_retries})...')
             time.sleep(_backoff)
+
+    # Broad web search is complemented by independent biomedical/scholarly
+    # registries.  This prevents a single backend (or a weak Crossref ranking)
+    # from becoming the mission's entire evidence corpus.
+    try:
+        from behive.engine.authority import ingest_authority_sources
+        authority_report = ingest_authority_sources(mission_id, topic, limit=min(20, max(8, scale // 10)))
+        _con = _connect_db(read_only=True)
+        _n_sources = _con.execute(
+            "SELECT COUNT(*) FROM hive_sources WHERE mission_id=?", [mission_id]
+        ).fetchone()[0]
+        _con.close()
+        _emit(mission_id, 'scout', 'authority_completed', data=authority_report)
+        log.info("  Authority discovery: %s verified sources across %s registries",
+                 authority_report.get("verified_sources", 0), len(authority_report.get("registries", [])))
+    except Exception as authority_error:
+        log.warning("  Authority discovery failed without discarding broad-search results: %s", authority_error)
     
     timings['scout'] = time.time() - t1
     _emit(mission_id, 'scout', 'completed', data={'sources_found': _n_sources})
@@ -2430,7 +2447,7 @@ def cmd_analyze(mission_id: str) -> dict:
     return analyze_mission(mission_id)
 
 
-def cleanup_stuck_missions(max_age_hours: int = 2) -> int:
+def cleanup_stuck_missions(max_age_hours: int = 2, exclude_mission_id: str | None = None) -> int:
     """Mark missions stuck in intermediate states as 'error'.
     
     A mission is 'stuck' if it's been in scout/harvest/process/synth/planning/running
@@ -2445,8 +2462,9 @@ def cleanup_stuck_missions(max_age_hours: int = 2) -> int:
             SET status = 'error', phase = 'timeout'
             WHERE status IN ('scout', 'harvest', 'process', 'synth', 'planning', 'running')
             AND created_at < NOW() - make_interval(hours := %s)
+            AND (%s IS NULL OR id <> %s)
             RETURNING id
-        """, [max_age_hours])
+        """, [max_age_hours, exclude_mission_id, exclude_mission_id])
         stuck = cur.fetchall()
         con.commit()
         con.close()

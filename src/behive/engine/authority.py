@@ -38,6 +38,37 @@ def _plain(value: str | None) -> str:
     return re.sub(r"\s+", " ", value).strip()
 
 
+_QUERY_STOPWORDS = {
+    "about", "after", "against", "among", "and", "are", "benefit", "benefits",
+    "boosting", "could", "does", "effect", "effects", "for", "from", "have",
+    "how", "into", "levels", "other", "reduce", "reducing", "research", "the",
+    "their", "these", "this", "what", "when", "where", "which", "with",
+}
+
+
+def _is_relevant(topic: str, title: str, abstract: str = "") -> bool:
+    """Reject registry ranking noise before it can masquerade as evidence."""
+    query_terms = {
+        token.lower() for token in re.findall(r"[A-Za-z0-9-]{3,}", topic)
+        if token.lower() not in _QUERY_STOPWORDS
+    }
+    if not query_terms:
+        return True
+    haystack = f"{title} {abstract}".lower()
+    matches = {term for term in query_terms if term in haystack}
+    # A distinctive named subject is sufficient; otherwise require two query
+    # concepts so broad words such as energy cannot admit an unrelated record.
+    longest = max(map(len, query_terms))
+    # Long subject names (oxaloacetate, mycelium, transthyretin, etc.) are the
+    # query's identity.  Generic overlap such as "energy" + "levels" must not
+    # outrank absence of that identity.
+    anchors = {term for term in query_terms if len(term) >= 9 and len(term) >= longest - 1}
+    if anchors:
+        return bool(matches & anchors)
+    distinctive = {term for term in query_terms if any(ch.isdigit() for ch in term)}
+    return bool(matches & distinctive) or len(matches) >= min(2, len(query_terms))
+
+
 def _xml_text(value: str) -> str:
     try:
         return re.sub(r"\s+", " ", " ".join(ET.fromstring(value).itertext())).strip()
@@ -142,6 +173,8 @@ def _crossref(mission_id: str, topic: str, db, limit: int) -> dict:
         if not doi or not title:
             continue
         abstract = _plain(item.get("abstract"))
+        if not _is_relevant(topic, title, abstract):
+            continue
         authors = ", ".join(" ".join(filter(None, (a.get("given"), a.get("family")))) for a in item.get("author", []))
         dates = (item.get("published-print") or item.get("published-online") or {}).get("date-parts") or []
         provenance = {"registry": "Crossref", "doi": doi, "publisher": item.get("publisher"),
@@ -205,6 +238,7 @@ def _openalex(mission_id: str, topic: str, db, limit: int) -> dict:
     for item in results:
         oid=str(item.get("id") or "").rsplit("/",1)[-1]; title=item.get("title"); doi=item.get("doi")
         if not oid or not title: continue
+        if not _is_relevant(topic, title): continue
         location=item.get("primary_location") or {}; landing=location.get("landing_page_url") or doi or item.get("id")
         authors=", ".join((a.get("author") or {}).get("display_name","") for a in item.get("authorships") or [])
         provenance={"registry":"OpenAlex","openalex_id":oid,"doi":doi,"published":item.get("publication_year"),

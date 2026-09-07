@@ -122,7 +122,10 @@ class TokenBucket:
         return True
 
 
-_rate_limiter = TokenBucket(rate=60, per=60)
+# The browser dashboard polls several independent mission, graph, collection, and
+# controller endpoints.  Sixty requests/minute was low enough for one open tab to
+# throttle itself and turn a completed mission into an apparent research error.
+_rate_limiter = TokenBucket(rate=600, per=60)
 _research_limiter = TokenBucket(rate=5, per=60)
 
 
@@ -282,7 +285,7 @@ def _emit_event(mission_id: str, event: str, data: dict):
 async def security_middleware(request: Request, call_next):
     client_ip = request.headers.get("X-Forwarded-For", request.client.host if request.client else "unknown")
     if not _rate_limiter.is_allowed(client_ip):
-        return JSONResponse(status_code=429, content={"detail": "Too many requests. Max 60/min."}, headers={"Retry-After": "60"})
+        return JSONResponse(status_code=429, content={"detail": "Too many requests. Max 600/min."}, headers={"Retry-After": "60"})
     if request.url.path == "/research" and request.method == "POST":
         if not _research_limiter.is_allowed(client_ip):
             return JSONResponse(status_code=429, content={"detail": "Research rate limit: max 5/min."}, headers={"Retry-After": "60"})
@@ -576,7 +579,7 @@ async def recover_research(mission_id: str):
         running_task = _mission_runtime.get(mission_id)
         if running_task and running_task.get("returncode") is None:
             raise HTTPException(409, "This mission already has an active worker")
-        cur.execute("SELECT topic,COALESCE(quality_metrics,'{}'::jsonb) FROM hive_missions WHERE id=%s", (mission_id,))
+        cur.execute("SELECT topic,COALESCE(quality_metrics,'{}'::jsonb),status FROM hive_missions WHERE id=%s", (mission_id,))
         row = cur.fetchone()
         if not row:
             conn.close()
@@ -589,7 +592,11 @@ async def recover_research(mission_id: str):
         claims = cur.fetchone()[0] or 0
         cur.execute("SELECT LENGTH(COALESCE(synthesis,'')) FROM hive_missions WHERE id=%s", (mission_id,))
         synthesis_length = cur.fetchone()[0] or 0
-        stage = "scout" if sources == 0 else "harvest" if content == 0 else "process" if claims == 0 else "synth" if synthesis_length < 100 else "done"
+        # An insufficient terminal state means the corpus failed, not merely the
+        # extractor.  Reprocessing the same documents can never improve source
+        # relevance or diversity, so force a complete authority-first re-scout.
+        insufficient = row[2] == "insufficient" or (row[1] or {}).get("outcome") == "insufficient_evidence"
+        stage = "scout" if insufficient or sources == 0 else "harvest" if content == 0 else "process" if claims == 0 else "synth" if synthesis_length < 100 else "done"
         if stage == "done":
             conn.close()
             return {"mission_id": mission_id, "status": "done", "recovery_stage": "none"}
@@ -607,7 +614,9 @@ async def recover_research(mission_id: str):
         return {"mission_id": mission_id, "status": "recovering", "recovery_stage": stage,
                 "attempt": recovery_attempt,
                 "checkpoints": {"sources": sources, "content": content, "claims": claims},
-                "message": f"Reusing {sources} sources and {content} documents; resuming at {stage}"}
+                "message": (f"Insufficient corpus detected; running a fresh, diversified authority search"
+                            if insufficient else
+                            f"Reusing {sources} sources and {content} documents; resuming at {stage}")}
     except HTTPException:
         raise
     except Exception as e:
