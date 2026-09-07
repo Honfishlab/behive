@@ -26,7 +26,7 @@ def _get_semaphore() -> asyncio.Semaphore:
         _mission_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_MISSIONS)
     return _mission_semaphore
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
@@ -223,6 +223,10 @@ app.add_middleware(
 _web_dir = Path(__file__).parent / "web"
 if _web_dir.exists():
     app.mount("/app/assets", StaticFiles(directory=_web_dir), name="research-app-assets")
+
+    @app.get("/", include_in_schema=False)
+    async def research_workspace_redirect():
+        return RedirectResponse(url="/app", status_code=307)
 
     @app.get("/app", include_in_schema=False)
     async def research_workspace():
