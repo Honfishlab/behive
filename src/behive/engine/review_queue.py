@@ -21,9 +21,18 @@ def ensure_schema(db=None):
 
 def list_reviews(mission_id: str) -> dict:
     db=connect(); ensure_schema(db)
+    mission=db.execute("SELECT project_id FROM hive_missions WHERE id=?",[mission_id]).fetchone()
+    if not mission:
+        db.close(); raise ValueError('Mission not found')
     rows=db.execute("SELECT c.id,c.claim,c.evidence,c.source_url,c.claim_type,c.confidence,c.quality_score,c.verified,c.source_tier,c.quality_details,r.decision,r.note,r.updated_at,COALESCE(c.integrity_status,'unaudited'),COALESCE(c.integrity_score,0),COALESCE(c.integrity_details,'{}'::jsonb),COALESCE(c.is_garbage,FALSE) FROM hive_claims c LEFT JOIN hive_claim_reviews r ON r.mission_id=c.mission_id AND r.claim_id=c.id WHERE c.mission_id=? ORDER BY CASE WHEN r.decision IS NULL THEN 0 WHEN r.decision='needs_more' THEN 1 ELSE 2 END,c.quality_score DESC,c.id DESC LIMIT 500",[mission_id]).fetchall(); db.close()
     items=[{'id':r[0],'claim':r[1],'evidence':r[2] or '','source_url':r[3] or '','claim_type':r[4] or 'finding','confidence':r[5] or 0,'quality':r[6] or 0,'verified':bool(r[7]),'source_tier':r[8],'quality_details':r[9] or {},'decision':r[10] or 'pending','note':r[11] or '','reviewed_at':r[12],'integrity_status':r[13],'integrity_score':r[14],'integrity_details':r[15] or {},'quarantined':bool(r[16])} for r in rows]
-    return {'mission_id':mission_id,'items':items,'metrics':{'total':len(items),'pending':sum(x['decision']=='pending' for x in items),'approved':sum(x['decision']=='approved' for x in items),'rejected':sum(x['decision']=='rejected' for x in items),'needs_more':sum(x['decision']=='needs_more' for x in items)}}
+    active=[x for x in items if not x['quarantined']]
+    return {'mission_id':mission_id,'project_id':mission[0],'items':items,'metrics':{
+        'total':len(active),'quarantined':len(items)-len(active),
+        'pending':sum(x['decision']=='pending' for x in active),
+        'approved':sum(x['decision']=='approved' for x in active),
+        'rejected':sum(x['decision']=='rejected' for x in active),
+        'needs_more':sum(x['decision']=='needs_more' for x in active)}}
 
 def decide(mission_id: str, claim_id: int, decision: str, note: str='') -> dict:
     if decision not in {'approved','rejected','needs_more','pending'}: raise ValueError('Unsupported review decision')

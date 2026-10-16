@@ -105,6 +105,44 @@ class TestPrescoutTopicDQFilter:
         assert isinstance(r, dict)
 
 
+class TestAuthorityTopicAdmission:
+    def test_named_subject_rejects_broad_disease_noise(self):
+        from behive.engine.authority import _is_relevant
+
+        topic = "What are the benefits of oxaloacetate in boosting energy and reducing glutamate levels in ALS?"
+        assert not _is_relevant(topic, "Effect of Finerenone in Patients With Heart Failure")
+        assert not _is_relevant(topic, "Detection of Alzheimer Neuropathology in Alzheimer Disease")
+        assert not _is_relevant(topic, "Efficacy and Safety of Zilucoplan in Amyotrophic Lateral Sclerosis")
+        assert not _is_relevant(topic, "Oxaloacetate decarboxylase in Klebsiella aerogenes")
+
+    def test_named_subject_accepts_direct_or_mechanistic_evidence(self):
+        from behive.engine.authority import _is_relevant
+
+        topic = "What are the benefits of oxaloacetate in boosting energy and reducing glutamate levels in ALS?"
+        assert _is_relevant(topic, "Oxaloacetate treatment lowers glutamate in a neurological disease model")
+        assert _is_relevant(topic, "Bioenergetic effects of oxaloacetate in amyotrophic lateral sclerosis")
+
+    def test_research_method_words_do_not_replace_named_subject_anchor(self):
+        from behive.engine.authority import _is_relevant
+
+        topic = ("Oxaloacetate and glutamate in ALS. Prioritize primary human trials, registered "
+                 "clinical studies, pharmacokinetics, and authoritative biomedical databases.")
+        assert _is_relevant(topic, "Trial of Oxaloacetate in ALS")
+        assert not _is_relevant(topic, "A registered clinical study of finerenone in heart failure")
+
+    def test_claim_gate_rejects_unrelated_clinical_result(self):
+        from behive.engine.topic_integrity import claim_is_relevant
+        topic = "What are the benefits of oxaloacetate in boosting energy and reducing glutamate levels in ALS?"
+        assert not claim_is_relevant(topic, "Finerenone reduced diabetes risk in heart failure patients.",
+                                     "A prespecified FINEARTS-HF analysis.")
+
+    def test_claim_gate_accepts_subject_and_context(self):
+        from behive.engine.topic_integrity import claim_is_relevant
+        topic = "What are the benefits of oxaloacetate in boosting energy and reducing glutamate levels in ALS?"
+        assert claim_is_relevant(topic, "Oxaloacetate may enhance mitochondrial bioenergetics in ALS.",
+                                 "A study of oxaloacetate in amyotrophic lateral sclerosis.")
+
+
 class TestPrescoutRouteResource:
     def test_route_arxiv(self):
         from behive.engine.prescout import route_resource

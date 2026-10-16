@@ -12,6 +12,7 @@ import urllib.request
 import xml.etree.ElementTree as ET
 
 from behive.engine.db import connect
+from behive.engine.research_intent import assess_relevance, build_query_families
 
 log = logging.getLogger(__name__)
 AGENT = "BeHive-Research-OS/1.0 (verified scholarly discovery)"
@@ -43,30 +44,16 @@ _QUERY_STOPWORDS = {
     "boosting", "complementary", "could", "does", "effect", "effects", "for", "from", "have",
     "how", "into", "levels", "other", "reduce", "reducing", "research", "the",
     "their", "therapies", "therapy", "these", "this", "what", "when", "where", "which", "with",
+    "animal", "authoritative", "biochemical", "biomedical", "clinical", "data", "databases",
+    "direct", "distinguish", "evidence", "human", "inference", "mechanistic", "pharmacokinetics",
+    "not", "peer-reviewed", "primary", "prioritize", "registered", "safety", "search", "snippets",
+    "studies", "trials", "treat",
 }
 
 
 def _is_relevant(topic: str, title: str, abstract: str = "") -> bool:
-    """Reject registry ranking noise before it can masquerade as evidence."""
-    query_terms = {
-        token.lower() for token in re.findall(r"[A-Za-z0-9-]{3,}", topic)
-        if token.lower() not in _QUERY_STOPWORDS
-    }
-    if not query_terms:
-        return True
-    haystack = f"{title} {abstract}".lower()
-    matches = {term for term in query_terms if term in haystack}
-    # A distinctive named subject is sufficient; otherwise require two query
-    # concepts so broad words such as energy cannot admit an unrelated record.
-    longest = max(map(len, query_terms))
-    # Long subject names (oxaloacetate, mycelium, transthyretin, etc.) are the
-    # query's identity.  Generic overlap such as "energy" + "levels" must not
-    # outrank absence of that identity.
-    anchors = {term for term in query_terms if len(term) >= 9 and len(term) >= longest - 1}
-    if anchors:
-        return bool(matches & anchors)
-    distinctive = {term for term in query_terms if any(ch.isdigit() for ch in term)}
-    return bool(matches & distinctive) or len(matches) >= min(2, len(query_terms))
+    """Explainable entity-and-context admission, shared by sources and claims."""
+    return bool(assess_relevance(topic, title, abstract)["accepted"])
 
 
 def _xml_text(value: str) -> str:
@@ -86,12 +73,21 @@ def _ensure_schema(db) -> None:
         "ALTER TABLE hive_sources ADD COLUMN IF NOT EXISTS is_primary BOOLEAN",
     ):
         db.execute(statement)
+    from behive.engine.evidence_ledger import ensure_schema
+    ensure_schema(db)
 
 
 def _save(db, mission_id: str, *, url: str, title: str, abstract: str, source_type: str,
           method: str, persistent_id: str, tier: int, authority: int,
           open_access: bool | None, primary: bool | None, provenance: dict,
           content: str = "") -> bool:
+    topic_row = db.execute("SELECT topic FROM hive_missions WHERE id=?", [mission_id]).fetchone()
+    relevance = assess_relevance(topic_row[0] if topic_row else "", title, abstract or content)
+    if not relevance["accepted"]:
+        from behive.engine.evidence_ledger import record
+        record(mission_id, "scout", "source", "rejected", item_id=url,
+               reason="entity/context relevance gate", details=relevance, db=db)
+        return False
     domain = urllib.parse.urlparse(url).netloc.lower().removeprefix("www.")
     existed = db.execute("SELECT 1 FROM hive_sources WHERE mission_id=? AND url=?", [mission_id, url]).fetchone()
     db.execute(
@@ -101,7 +97,8 @@ def _save(db, mission_id: str, *, url: str, title: str, abstract: str, source_ty
             verification_status,persistent_id,provenance,is_open_access,is_primary)
            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?::jsonb,?,?) ON CONFLICT DO NOTHING""",
         [mission_id, url, domain, title[:512], abstract[:1024], source_type, method,
-         min(100, 76 + authority), 25, 8, authority, 15 if content else 8, "scouted", tier,
+         min(100, round(relevance["score"] * 45) + 8 + authority + (15 if content else 8)),
+         round(relevance["score"] * 45), 8, authority, 15 if content else 8, "scouted", tier,
          "registry_verified", persistent_id, json.dumps(provenance), open_access, primary],
     )
     words = len(content.split())
@@ -117,6 +114,9 @@ def _save(db, mission_id: str, *, url: str, title: str, abstract: str, source_ty
              json.dumps([persistent_id, "registry_verified", f"evidence_tier_{tier}"])],
         )
         db.execute("UPDATE hive_sources SET status='done' WHERE mission_id=? AND url=?", [mission_id, url])
+    from behive.engine.evidence_ledger import record
+    record(mission_id, "scout", "source", "admitted", item_id=url,
+           reason="matched canonical research intent", details=relevance, db=db)
     return not existed
 
 
@@ -133,6 +133,9 @@ def _europe_pmc(mission_id: str, topic: str, db, limit: int) -> dict:
         pmcid, doi = item.get("pmcid"), item.get("doi")
         persistent_id = f"PMCID:{pmcid}" if pmcid else f"PMID:{item.get('pmid') or record_id}"
         abstract = _plain(item.get("abstractText"))
+        title = item.get("title") or persistent_id
+        if not _is_relevant(topic, title, abstract):
+            continue
         content, method = abstract, "europe_pmc_abstract"
         is_oa = str(item.get("isOpenAccess", "N")).upper() == "Y"
         if pmcid and is_oa and full_text < 8:
@@ -151,7 +154,7 @@ def _europe_pmc(mission_id: str, topic: str, db, limit: int) -> dict:
                       "published": item.get("firstPublicationDate") or item.get("pubYear"),
                       "cited_by_count": item.get("citedByCount"), "open_access": is_oa}
         if _save(db, mission_id, url=f"https://europepmc.org/article/{source}/{record_id}",
-                 title=item.get("title") or persistent_id, abstract=abstract,
+                 title=title, abstract=abstract,
                  source_type="scholarly_primary", method=method, persistent_id=persistent_id,
                  tier=1, authority=20, open_access=is_oa, primary=True,
                  provenance=provenance, content=content):
@@ -202,6 +205,7 @@ def _pubmed(mission_id: str, topic: str, db, limit: int) -> dict:
         pmid = _plain(article.findtext(".//PMID")); title = _xml_text(ET.tostring(article.find(".//ArticleTitle"), encoding="unicode")) if article.find(".//ArticleTitle") is not None else pmid
         abstract = " ".join(_plain("".join(x.itertext())) for x in article.findall(".//AbstractText"))
         if not pmid or not title: continue
+        if not _is_relevant(topic, title, abstract): continue
         publication_types = [_plain(x.text) for x in article.findall(".//PublicationType")]
         provenance={"registry":"PubMed","pmid":pmid,"journal":_plain(article.findtext(".//Journal/Title")),
                     "published":_plain(article.findtext(".//PubDate/Year")),"publication_types":publication_types}
@@ -224,6 +228,7 @@ def _clinical_trials(mission_id: str, topic: str, db, limit: int) -> dict:
         content=" ".join(filter(None,[title,identification.get("officialTitle"),
             (protocol.get("descriptionModule",{}) or {}).get("briefSummary"),
             json.dumps(design,default=str),json.dumps(outcomes,default=str)]))
+        if not _is_relevant(topic, title, content): continue
         provenance={"registry":"ClinicalTrials.gov","nct_id":nct,"overall_status":status.get("overallStatus"),
                     "study_type":design.get("studyType"),"phases":design.get("phases") or []}
         if _save(db,mission_id,url=f"https://clinicaltrials.gov/study/{nct}",title=title,abstract=content[:4000],
@@ -261,6 +266,7 @@ def _geo(mission_id: str, topic: str, db, limit: int) -> dict:
         item=summary.get(uid) or {}; accession=item.get("accession"); title=item.get("title")
         if not accession or not title: continue
         content=" ".join(filter(None,[title,item.get("summary"),item.get("overall_design"),item.get("organism")]))
+        if not _is_relevant(topic, title, content): continue
         provenance={"registry":"NCBI GEO","accession":accession,"organism":item.get("taxon"),
                     "samples":item.get("n_samples"),"published":item.get("pdat")}
         if _save(db,mission_id,url=f"https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc={accession}",title=title,
@@ -277,6 +283,7 @@ def _nih_reporter(mission_id: str, topic: str, db, limit: int) -> dict:
         project_num=item.get("project_num") or item.get("core_project_num"); title=item.get("project_title")
         if not project_num or not title: continue
         content=" ".join(filter(None,[title,item.get("abstract_text"),item.get("terms")]))
+        if not _is_relevant(topic, title, content): continue
         org=item.get("organization") or {}; provenance={"registry":"NIH RePORTER","project_num":project_num,
             "fiscal_year":item.get("fiscal_year"),"organization":org.get("org_name"),"principal_investigators":item.get("principal_investigators") or []}
         if _save(db,mission_id,url=f"https://reporter.nih.gov/project-details/{urllib.parse.quote(str(item.get('appl_id') or project_num))}",
@@ -301,12 +308,22 @@ def ingest_authority_sources(mission_id: str, topic: str, limit: int = 25, sourc
     }
     selected=routes.get(source_family) or (("Europe PMC",_europe_pmc),("Crossref",_crossref),("PubMed",_pubmed),("OpenAlex",_openalex))
     reports, errors = [], []
+    families = build_query_families(topic)
+    # Query families prevent one broad natural-language query from determining
+    # the entire corpus. Admission still uses the canonical mission topic.
+    per_query = max(3, min(8, limit // max(1, len(families))))
     for name, function in selected:
-        try:
-            reports.append(function(mission_id, topic, db, limit))
-        except Exception as exc:
-            log.warning("Authority registry %s failed: %s", name, exc)
-            errors.append({"registry": name, "error": str(exc)[:300]})
+        for family in families:
+            try:
+                # Registry calls use the focused query. _save independently
+                # enforces relevance against the canonical mission topic.
+                report = function(mission_id, family["query"], db, per_query)
+                report["purpose"] = family["purpose"]
+                report["query"] = family["query"]
+                reports.append(report)
+            except Exception as exc:
+                log.warning("Authority registry %s failed for %s: %s", name, family["purpose"], exc)
+                errors.append({"registry": name, "purpose": family["purpose"], "error": str(exc)[:300]})
     counts = db.execute(
         """SELECT COUNT(*), COUNT(*) FILTER (WHERE status='done'),
                   COUNT(*) FILTER (WHERE evidence_tier=1)

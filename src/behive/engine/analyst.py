@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 
 from behive.engine.db import connect
 from behive.engine.llm import complete
+from behive.engine.topic_integrity import quarantine_irrelevant_claims
 
 log = logging.getLogger(__name__)
 
@@ -37,6 +38,7 @@ def _json(text: str) -> dict:
 
 def analyze_mission(mission_id: str) -> dict:
     """Build comparative analysis while keeping sourced facts and deductions distinct."""
+    quarantine_irrelevant_claims(mission_id)
     with connect(read_only=True) as con:
         mission = con.execute("SELECT topic FROM hive_missions WHERE id=?", [mission_id]).fetchone()
         if not mission:
@@ -121,6 +123,16 @@ SOURCE MATERIAL
             "claim_count=EXCLUDED.claim_count,updated_at=NOW()",
             [mission_id, json.dumps(analysis), readiness, len(docs), len(unique_urls), len(claims)],
         )
+        # A mission previously labelled insufficient may become viable after a
+        # relevance-gate repair or targeted recovery. Keep terminal state and
+        # visible summary synchronized with the recovered evidence.
+        if claims and readiness in ("limited", "sufficient"):
+            con.execute(
+                "UPDATE hive_missions SET status='done',phase='done',total_facts=?,synthesis=?,"
+                "quality_metrics=(COALESCE(quality_metrics,'{}'::jsonb)-'outcome_code')||"
+                "jsonb_build_object('outcome','evidence_recovered','recovered_claims',?) WHERE id=?",
+                [len(claims), str(analysis.get("executive_assessment") or "")[:12000], len(claims), mission_id],
+            )
         for gap in analysis.get("research_gaps", [])[:10]:
             if not isinstance(gap, dict) or not gap.get("question"):
                 continue

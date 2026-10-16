@@ -223,6 +223,29 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.middleware("http")
+async def enforce_mission_project_ownership(request: Request, call_next):
+    """Reject cross-project mission reads/writes from the web workspace."""
+    match = re.match(r"^/research/([^/]+)(?:/|$)", request.url.path)
+    supplied_project = request.headers.get("X-Behive-Project")
+    if match and supplied_project:
+        mission_id = match.group(1)
+        try:
+            conn = get_db(); cur = conn.cursor()
+            cur.execute("SELECT project_id FROM hive_missions WHERE id=%s", (mission_id,))
+            row = cur.fetchone(); conn.close()
+            if row and row[0] and str(row[0]) != supplied_project:
+                return JSONResponse(status_code=409, content={
+                    "detail": "Mission belongs to a different investigation. Switch research history first.",
+                    "mission_id": mission_id,
+                })
+        except Exception:
+            # Database availability is reported by the target endpoint; the
+            # ownership guard must not disguise startup diagnostics.
+            pass
+    return await call_next(request)
+
 _web_dir = Path(__file__).parent / "web"
 if _web_dir.exists():
     app.mount("/app/assets", StaticFiles(directory=_web_dir), name="research-app-assets")
@@ -483,14 +506,14 @@ async def research_status(mission_id: str):
         conn = get_db()
         cur = conn.cursor()
         cur.execute(
-            "SELECT status,phase,topic,EXTRACT(EPOCH FROM NOW()-created_at),COALESCE(quality_metrics,'{}'::jsonb) "
+            "SELECT status,phase,topic,EXTRACT(EPOCH FROM NOW()-created_at),COALESCE(quality_metrics,'{}'::jsonb),project_id "
             "FROM hive_missions WHERE id = %s", (mission_id,)
         )
         row = cur.fetchone()
         if not row:
             conn.close()
             raise HTTPException(404, f"Mission {mission_id} not found")
-        status, phase, topic, mission_age, diagnostics = row
+        status, phase, topic, mission_age, diagnostics, project_id = row
         # Get current claims count
         cur.execute(
             "SELECT COUNT(*), COALESCE(AVG(quality_score), 0) FROM hive_claims WHERE mission_id = %s AND (is_garbage = false OR is_garbage IS NULL)",
@@ -552,6 +575,7 @@ async def research_status(mission_id: str):
         watchdog_state = max(checks, key=lambda item: severity[item["state"]])["state"]
         return {
             "mission_id": mission_id,
+            "project_id": project_id,
             "status": status,
             "phase": phase,
             "topic": topic,
@@ -596,7 +620,16 @@ async def recover_research(mission_id: str):
         # extractor.  Reprocessing the same documents can never improve source
         # relevance or diversity, so force a complete authority-first re-scout.
         insufficient = row[2] == "insufficient" or (row[1] or {}).get("outcome") == "insufficient_evidence"
-        stage = "scout" if insufficient or sources == 0 else "harvest" if content == 0 else "process" if claims == 0 else "synth" if synthesis_length < 100 else "done"
+        outcome_code = (row[1] or {}).get("outcome_code", "")
+        recovery_by_outcome = {
+            "retrieval_failed": "scout", "sources_off_topic": "scout",
+            "harvest_failed": "harvest", "full_text_unavailable": "harvest",
+            "extractor_unavailable": "process", "extractor_no_supported_claims": "process",
+            "claims_rejected_by_relevance": "process", "citation_integrity_failed": "process",
+            "genuine_evidence_boundary": "scout",
+        }
+        stage = recovery_by_outcome.get(outcome_code) if insufficient else None
+        stage = stage or ("scout" if sources == 0 else "harvest" if content == 0 else "process" if claims == 0 else "synth" if synthesis_length < 100 else "done")
         if stage == "done":
             conn.close()
             return {"mission_id": mission_id, "status": "done", "recovery_stage": "none"}
@@ -621,6 +654,34 @@ async def recover_research(mission_id: str):
         raise
     except Exception as e:
         raise HTTPException(500, str(e))
+
+
+@app.get("/research/{mission_id}/evidence-ledger")
+async def research_evidence_ledger(mission_id: str, limit: int = Query(250, ge=1, le=1000)):
+    """Expose source, passage, and integrity decisions for auditability."""
+    try:
+        from behive.engine.evidence_ledger import ensure_schema
+        from behive.engine.db import connect
+        db = connect(); ensure_schema(db)
+        decisions_rows = db.execute(
+            "SELECT id,stage,item_type,item_id,status,reason,details,created_at "
+            "FROM hive_evidence_ledger WHERE mission_id=? ORDER BY created_at DESC LIMIT ?",
+            [mission_id, limit],
+        ).fetchall()
+        decisions = [dict(zip(("id","stage","item_type","item_id","status","reason","details","created_at"), row))
+                     for row in decisions_rows]
+        passage_rows = db.execute(
+            "SELECT id,source_url,claim_id,passage,locator,evidence_type,direct_support,"
+            "relevance_score,metadata,created_at FROM hive_evidence_passages "
+            "WHERE mission_id=? ORDER BY created_at DESC LIMIT ?", [mission_id, limit],
+        ).fetchall()
+        passages = [dict(zip(("id","source_url","claim_id","passage","locator","evidence_type",
+                              "direct_support","relevance_score","metadata","created_at"), row))
+                    for row in passage_rows]
+        db.close()
+        return {"mission_id": mission_id, "decisions": decisions, "passages": passages}
+    except Exception as exc:
+        raise HTTPException(500, str(exc))
 
 
 # ─── 4. SSE Events Stream ────────────────────────────────────────────────────
@@ -663,14 +724,16 @@ async def research_events(mission_id: str):
 async def get_research(mission_id: str):
     """Get completed research results with claims."""
     try:
+        from behive.engine.topic_integrity import quarantine_irrelevant_claims
+        quarantine_irrelevant_claims(mission_id)
         conn = get_db()
         cur = conn.cursor()
-        cur.execute("SELECT topic, status, phase, synthesis FROM hive_missions WHERE id = %s", (mission_id,))
+        cur.execute("SELECT topic, status, phase, synthesis, project_id FROM hive_missions WHERE id = %s", (mission_id,))
         row = cur.fetchone()
         if not row:
             conn.close()
             raise HTTPException(404, f"Mission {mission_id} not found")
-        topic, status, phase, report = row
+        topic, status, phase, report, project_id = row
         cur.execute("""
             SELECT claim, confidence, quality_score, source_url, claim_type
             FROM hive_claims
@@ -685,6 +748,7 @@ async def get_research(mission_id: str):
         avg_q = sum(c["quality_score"] or 0 for c in claims) / max(1, len(claims))
         return {
             "mission_id": mission_id,
+            "project_id": project_id,
             "topic": topic,
             "status": status,
             "phase": phase,
@@ -752,7 +816,8 @@ async def get_research_evidence(mission_id: str):
                    c.quality_score, c.author, c.published_date, c.harvested_at,
                    COUNT(cl.id) AS claim_count, MIN(s.evidence_tier),
                    MAX(s.verification_status), MAX(s.persistent_id),
-                   BOOL_OR(COALESCE(s.is_primary,FALSE)), BOOL_OR(COALESCE(s.is_open_access,FALSE))
+                   BOOL_OR(COALESCE(s.is_primary,FALSE)), BOOL_OR(COALESCE(s.is_open_access,FALSE)),
+                   MAX(s.snippet)
             FROM hive_content c
             LEFT JOIN hive_claims cl ON cl.mission_id=c.mission_id AND cl.source_url=c.url
               AND (cl.is_garbage=false OR cl.is_garbage IS NULL)
@@ -769,12 +834,27 @@ async def get_research_evidence(mission_id: str):
                     "published_date": r[7] or "", "harvested_at": r[8].isoformat() if r[8] else "",
                     "claim_count": r[9] or 0, "evidence_tier": r[10],
                     "verification_status": r[11] or "unverified", "persistent_id": r[12] or "",
-                    "is_primary": bool(r[13]), "is_open_access": bool(r[14])} for r in cur.fetchall()]
+                    "is_primary": bool(r[13]), "is_open_access": bool(r[14]),
+                    "abstract": r[15] or ""} for r in cur.fetchall()]
         conn.close()
-        from behive.engine.authority import _is_relevant
-        library = [item for item in all_documents
-                   if item["claim_count"] > 0 or _is_relevant(mission_topic, item["title"])]
-        quarantined = len(all_documents) - len(library)
+        from behive.engine.research_intent import assess_relevance
+        # Citation creation is not proof of topical relevance.  A bad extraction
+        # can cite an authoritative but unrelated record, so every document must
+        # independently pass the mission-topic gate before it reaches the library.
+        assessed = [(item, assess_relevance(mission_topic, item["title"], item["abstract"]))
+                    for item in all_documents]
+        relevant = [(item, result) for item, result in assessed if result["accepted"]]
+        # Keep the visible library investigation-focused. Broad background can
+        # aid discovery, but it is not promoted until its title names the entity,
+        # it addresses the mission's disease context, or it supports a finding.
+        library = []
+        for item, result in relevant:
+            mission_specific = bool({"als", "neurodegeneration"}.intersection(result["context_hits"]))
+            if item["claim_count"] > 0 or result["title_entity_hits"] or mission_specific:
+                item["relevance"] = result
+                library.append(item)
+        quarantined = len(all_documents) - len(relevant)
+        background = len(relevant) - len(library)
         bibliography = [{"number": i + 1, "title": item["title"], "url": item["url"],
                          "domain": item["domain"], "author": item["author"],
                          "published_date": item["published_date"], "accessed_at": item["harvested_at"],
@@ -788,6 +868,7 @@ async def get_research_evidence(mission_id: str):
                             "registry_verified": sum(x["verification_status"] == "registry_verified" for x in library),
                             "tier_one": sum(x["evidence_tier"] == 1 for x in library),
                             "quarantined_irrelevant": quarantined,
+                            "background_not_promoted": background,
                             "documents_examined": len(all_documents)}}
     except HTTPException:
         raise
@@ -848,8 +929,11 @@ async def list_research_decisions(mission_id: str, subject_key: str | None = Non
 
 @app.get("/research/{mission_id}/reviews")
 async def list_claim_reviews(mission_id: str):
-    from behive.engine.review_queue import list_reviews
-    return await asyncio.to_thread(list_reviews, mission_id)
+    try:
+        from behive.engine.review_queue import list_reviews
+        return await asyncio.to_thread(list_reviews, mission_id)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc))
 
 
 @app.post("/research/{mission_id}/reviews/{claim_id}")
@@ -1426,7 +1510,7 @@ async def list_missions(limit: int = Query(20, ge=1, le=100), offset: int = Quer
         cur.execute("""
             SELECT m.id, m.topic, m.status, m.phase, m.created_at,
                    COALESCE(c.cnt, 0) as claims_count,
-                   COALESCE(c.avg_q, 0) as avg_quality
+                   COALESCE(c.avg_q, 0) as avg_quality, m.project_id
             FROM hive_missions m
             LEFT JOIN (
                 SELECT mission_id, COUNT(*) as cnt, AVG(quality_score) as avg_q
@@ -1441,6 +1525,7 @@ async def list_missions(limit: int = Query(20, ge=1, le=100), offset: int = Quer
                 "id": r[0], "topic": r[1], "status": r[2], "phase": r[3],
                 "created_at": r[4].isoformat() if r[4] else None,
                 "claims_count": r[5], "avg_quality": round(float(r[6] or 0), 4),
+                "project_id": r[7],
             }
             for r in cur.fetchall()
         ]

@@ -1103,7 +1103,13 @@ def _recover_snippet_content(mission_id: str, limit: int = 80) -> int:
 
 
 def _fallback_extract_claims(mission_id: str, limit: int = 30) -> int:
-    """Extract conservative, source-linked claims when optional worker modules yield none."""
+    """Run the supported passage-backed extractor (legacy entry point)."""
+    from behive.engine.claim_extractor import extract_mission_claims
+    return extract_mission_claims(mission_id, limit)
+
+
+def _legacy_fallback_extract_claims(mission_id: str, limit: int = 30) -> int:
+    """Deprecated pre-ledger extractor retained temporarily for compatibility."""
     if _llm_complete is None:
         return 0
     con = _connect_db(read_only=True)
@@ -1203,7 +1209,8 @@ Return {{"claims": []}} if nothing is supported.
     return saved
 
 
-def _record_insufficient_evidence(mission_id: str, document_count: int) -> dict:
+def _record_insufficient_evidence(mission_id: str, document_count: int,
+                                  outcome_code: str = "genuine_evidence_boundary") -> dict:
     """Persist a truthful no-evidence result instead of reporting a pipeline crash."""
     from behive.engine.analyst import ANALYSIS_SCHEMA
     con = _connect_db(read_only=True)
@@ -1255,8 +1262,9 @@ def _record_insufficient_evidence(mission_id: str, document_count: int) -> dict:
         )
         write_con.execute(
             "UPDATE hive_missions SET status='insufficient',phase='insufficient',synthesis=?,process_done_at=NOW(),"
-            "quality_metrics=COALESCE(quality_metrics,'{}'::jsonb)||jsonb_build_object('outcome','insufficient_evidence','documents_reviewed',?) WHERE id=?",
-            [report, document_count, mission_id],
+            "quality_metrics=COALESCE(quality_metrics,'{}'::jsonb)||jsonb_build_object("
+            "'outcome','insufficient_evidence','outcome_code',?,'documents_reviewed',?) WHERE id=?",
+            [report, outcome_code, document_count, mission_id],
         )
         write_con.commit()
     finally:
@@ -1882,7 +1890,7 @@ def _run_pipeline_phases(mission_id: str, topic: str, plan: list, timings: dict,
             _emit(mission_id, 'process', 'fallback_completed', data={'claims': _claims_after_process})
         else:
             log.warning("No defensible findings after both extraction strategies; recording insufficient evidence")
-            outcome = _record_insufficient_evidence(mission_id, _n_harvested)
+            outcome = _record_insufficient_evidence(mission_id, _n_harvested, "extractor_no_supported_claims")
             _emit(mission_id, 'process', 'insufficient_evidence', data=outcome)
             try:
                 from behive.engine.frontier import run_frontier_cycle
@@ -1891,6 +1899,26 @@ def _run_pipeline_phases(mission_id: str, topic: str, plan: list, timings: dict,
                 log.warning(f"Discovery mapping failed without invalidating evidence state: {discovery_error}")
             return
     log.info(f'  └─ done · {timings["process"]:.1f}s ──────────────────────────────┘\n')
+
+    # A source may be reputable yet unrelated. Enforce mission relevance on
+    # extracted claims before any downstream falsification or synthesis.
+    try:
+        from behive.engine.topic_integrity import quarantine_irrelevant_claims
+        _integrity = quarantine_irrelevant_claims(mission_id)
+        if _integrity["quarantined"]:
+            log.warning(
+                "Topic-integrity gate quarantined %s/%s extracted claims",
+                _integrity["quarantined"], _integrity["examined"],
+            )
+            _emit(mission_id, 'process', 'claims_quarantined', data=_integrity)
+        _claims_after_process -= _integrity["quarantined"]
+    except Exception as _integrity_error:
+        log.error("Topic-integrity gate failed: %s", _integrity_error)
+        raise RuntimeError(f"Claim integrity gate failed: {_integrity_error}") from _integrity_error
+    if _claims_after_process <= 0:
+        outcome = _record_insufficient_evidence(mission_id, _n_harvested, "claims_rejected_by_relevance")
+        _emit(mission_id, 'process', 'insufficient_evidence', data=outcome)
+        return
 
     # ═══ PHASE 3.5: FALSIFIER (claim dedup + cross-validation) ══
     # Falsifier can explode combinatorially with many claims × depth-5.
@@ -2395,7 +2423,7 @@ def cmd_process(mission_id: str) -> None:
         claim_count = _fallback_extract_claims(mission_id)
     if claim_count == 0:
         log.warning("No defensible findings; recording an insufficient-evidence outcome instead of a pipeline failure")
-        _record_insufficient_evidence(mission_id, content_count)
+        _record_insufficient_evidence(mission_id, content_count, "extractor_no_supported_claims")
         try:
             from behive.engine.frontier import run_frontier_cycle
             discovery = run_frontier_cycle(mission_id, trigger="insufficient_evidence")
