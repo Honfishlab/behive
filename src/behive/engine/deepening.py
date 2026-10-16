@@ -94,14 +94,17 @@ def merge_qualified_evidence(run_id: int) -> dict:
         qualified_urls = {d[0] for d in docs}
         for d in docs:
             con.execute(
-                "INSERT INTO hive_sources (mission_id,url,domain,title,source_type,scout_method,language,status) "
-                "VALUES (?,?,?,?,?,'gap_deepening',?,'done') ON CONFLICT(mission_id,url) DO NOTHING",
-                [parent_id, d[0], d[2], d[1], d[10], d[6]],
+                "INSERT INTO hive_sources (mission_id,url,domain,title,source_type,harvest_method,status) "
+                "SELECT ?,?,?,?,?,'gap_deepening','done' WHERE NOT EXISTS "
+                "(SELECT 1 FROM hive_sources WHERE mission_id=? AND url=?)",
+                [parent_id, d[0], d[2], d[1], d[10], parent_id, d[0]],
             )
             con.execute(
                 "INSERT INTO hive_content (mission_id,url,domain,title,raw_text,word_count,harvest_method,language,quality_score,author,published_date) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(mission_id,url) DO NOTHING",
-                [parent_id, d[0], d[2], d[1], d[3], d[4], "gap_deepening", d[6], d[7], d[8], d[9]],
+                "SELECT ?,?,?,?,?,?,?,?,?,?,? WHERE NOT EXISTS "
+                "(SELECT 1 FROM hive_content WHERE mission_id=? AND url=?)",
+                [parent_id, d[0], d[2], d[1], d[3], d[4], "gap_deepening", d[6], d[7], d[8], d[9],
+                 parent_id, d[0]],
             )
         merged_claims = 0
         if qualified_urls:

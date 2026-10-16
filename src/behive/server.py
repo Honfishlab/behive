@@ -1426,7 +1426,16 @@ async def deepen_research_gap(mission_id: str, gap_id: int):
     if not row:
         conn.close(); raise HTTPException(404, "Research gap not found")
     cur.execute("SELECT id,child_mission_id FROM hive_gap_runs WHERE gap_id=%s AND status IN ('queued','scouting','harvesting','extracting','evaluating') ORDER BY id DESC LIMIT 1", (gap_id,))
-    active = cur.fetchone(); conn.close()
+    active = cur.fetchone()
+    failed_checkpoint = None
+    if not active:
+        cur.execute(
+            "SELECT r.id,r.child_mission_id FROM hive_gap_runs r WHERE r.gap_id=%s AND r.status='failed' "
+            "AND EXISTS (SELECT 1 FROM hive_content c WHERE c.mission_id=r.child_mission_id AND c.word_count>=300) "
+            "ORDER BY r.id DESC LIMIT 1", (gap_id,),
+        )
+        failed_checkpoint = cur.fetchone()
+    conn.close()
     if active:
         proc = _gap_processes.get(active[0])
         if proc and proc.returncode is None:
@@ -1438,6 +1447,15 @@ async def deepen_research_gap(mission_id: str, gap_id: int):
         asyncio.create_task(_run_gap_deepening(active[0], mission_id, gap_id, active[1], row[0]))
         return {"run_id": active[0], "gap_id": gap_id, "child_mission_id": active[1],
                 "status": "queued", "resumed": True}
+    if failed_checkpoint:
+        from behive.engine.deepening import update_run
+        update_run(failed_checkpoint[0], "evaluating", "Retrying merge from saved evidence checkpoint")
+        asyncio.create_task(_resume_gap_checkpoint(
+            failed_checkpoint[0], mission_id, gap_id, failed_checkpoint[1]
+        ))
+        return {"run_id": failed_checkpoint[0], "gap_id": gap_id,
+                "child_mission_id": failed_checkpoint[1], "status": "evaluating",
+                "resumed": True, "checkpoint": "merge"}
     child_id = f"gap_{mission_id[-10:]}_{gap_id}_{int(time.time())}"
     run_id = create_run(gap_id, mission_id, child_id)
     asyncio.create_task(_run_gap_deepening(run_id, mission_id, gap_id, child_id, row[0]))
@@ -1933,6 +1951,38 @@ async def _run_gap_deepening(run_id: int, parent_id: str, gap_id: int, child_id:
         await _run_gap_deepening_inner(run_id, parent_id, gap_id, child_id, question)
 
 
+async def _resume_gap_checkpoint(run_id: int, parent_id: str, gap_id: int, child_id: str):
+    """Resume a failed merge without repeating completed retrieval work."""
+    limiter = _gap_semaphores.setdefault(parent_id, asyncio.Semaphore(1))
+    async with limiter:
+        try:
+            await _evaluate_gap_checkpoint(run_id, parent_id, gap_id)
+        except Exception as exc:
+            from behive.engine.deepening import update_run
+            update_run(run_id, "failed", str(exc)[:500])
+
+
+async def _evaluate_gap_checkpoint(run_id: int, parent_id: str, gap_id: int):
+    """Apply evidence gates, merge qualified claims, and revise parent analysis."""
+    from behive.engine.deepening import merge_qualified_evidence, save_revision, update_run
+    update_run(run_id, "evaluating", "Applying full-text, independence, and primary-source gates")
+    conn = get_db(); cur = conn.cursor()
+    cur.execute("SELECT analysis FROM hive_analysis WHERE mission_id=%s", (parent_id,))
+    old_row = cur.fetchone(); previous = old_row[0] if old_row else None
+    conn.close()
+    metrics = await asyncio.to_thread(merge_qualified_evidence, run_id)
+    if metrics["merged_claims"] > 0:
+        from behive.engine.analyst import analyze_mission
+        current = await asyncio.to_thread(analyze_mission, parent_id)
+        reason = (f"Gap {gap_id} added {metrics['merged_claims']} findings from "
+                  f"{metrics['full_text_sources']} full-text sources ({metrics['primary_sources']} primary)")
+        await asyncio.to_thread(save_revision, parent_id, run_id, previous, current, reason)
+    status = "resolved" if metrics["resolved"] else "exhausted"
+    message = ("Evidence target reached; parent analysis revised" if metrics["resolved"] else
+               "Search completed but did not meet 3 full-text / 1 primary-source evidence gate")
+    update_run(run_id, status, message, **metrics)
+
+
 async def _run_gap_deepening_inner(run_id: int, parent_id: str, gap_id: int, child_id: str, question: str):
     """Run a narrow child mission, merge only qualified evidence, and selectively re-analyze."""
     import sys
@@ -1971,22 +2021,7 @@ async def _run_gap_deepening_inner(run_id: int, parent_id: str, gap_id: int, chi
             detail = " | ".join(line for line in output_tail if line)[-450:]
             update_run(run_id, "failed", f"Deep research worker exited with code {proc.returncode}: {detail}")
             return
-        update_run(run_id, "evaluating", "Applying full-text, independence, and primary-source gates")
-        conn = get_db(); cur = conn.cursor()
-        cur.execute("SELECT analysis FROM hive_analysis WHERE mission_id=%s", (parent_id,))
-        old_row = cur.fetchone(); previous = old_row[0] if old_row else None
-        conn.close()
-        metrics = merge_qualified_evidence(run_id)
-        if metrics["merged_claims"] > 0:
-            from behive.engine.analyst import analyze_mission
-            current = await asyncio.to_thread(analyze_mission, parent_id)
-            reason = (f"Gap {gap_id} added {metrics['merged_claims']} findings from "
-                      f"{metrics['full_text_sources']} full-text sources ({metrics['primary_sources']} primary)")
-            save_revision(parent_id, run_id, previous, current, reason)
-        status = "resolved" if metrics["resolved"] else "exhausted"
-        message = ("Evidence target reached; parent analysis revised" if metrics["resolved"] else
-                   "Search completed but did not meet 3 full-text / 1 primary-source evidence gate")
-        update_run(run_id, status, message, **metrics)
+        await _evaluate_gap_checkpoint(run_id, parent_id, gap_id)
     except Exception as exc:
         update_run(run_id, "failed", str(exc)[:500])
     finally:
