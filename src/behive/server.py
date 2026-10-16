@@ -286,6 +286,7 @@ _mission_events: dict[str, list[dict]] = defaultdict(list)
 _mission_subscribers: dict[str, list[asyncio.Queue]] = defaultdict(list)
 _mission_runtime: dict[str, dict] = {}
 _gap_processes: dict[int, asyncio.subprocess.Process] = {}
+_gap_semaphores: dict[str, asyncio.Semaphore] = {}
 
 
 def _emit_event(mission_id: str, event: str, data: dict):
@@ -889,12 +890,17 @@ async def get_living_research_summary(mission_id: str, refresh: bool = False):
 
 
 _boundary_tasks: dict[str, asyncio.Task] = {}
+_boundary_semaphores: dict[str, asyncio.Semaphore] = {}
 
 
-async def _run_boundary_program(program_id: str):
+async def _run_boundary_program(program_id: str, mission_id: str):
     try:
         from behive.engine.boundary_research import run_program
-        await asyncio.to_thread(run_program, program_id)
+        # At most two deepening programs per mission may perform registry and
+        # database work concurrently. Additional programs remain durably queued.
+        limiter = _boundary_semaphores.setdefault(mission_id, asyncio.Semaphore(2))
+        async with limiter:
+            await asyncio.to_thread(run_program, program_id)
     except Exception as exc:
         print(f"Boundary research {program_id} failed: {exc}")
     finally:
@@ -992,7 +998,7 @@ async def deepen_evidence_boundary(mission_id: str, body: BoundaryResearchReques
         task = _boundary_tasks.get(program["id"])
         if task and not task.done():
             raise HTTPException(409, "This evidence boundary is already being researched")
-        _boundary_tasks[program["id"]] = asyncio.create_task(_run_boundary_program(program["id"]))
+        _boundary_tasks[program["id"]] = asyncio.create_task(_run_boundary_program(program["id"], mission_id))
         return program
     except HTTPException:
         raise
@@ -1011,7 +1017,7 @@ async def rerun_evidence_boundary(mission_id: str, program_id: str):
     task = _boundary_tasks.get(program_id)
     if task and not task.done():
         raise HTTPException(409, "Evidence boundary research is already active")
-    _boundary_tasks[program_id] = asyncio.create_task(_run_boundary_program(program_id))
+    _boundary_tasks[program_id] = asyncio.create_task(_run_boundary_program(program_id, mission_id))
     return {"id": program_id, "status": "queued"}
 
 
@@ -1419,10 +1425,19 @@ async def deepen_research_gap(mission_id: str, gap_id: int):
     row = cur.fetchone()
     if not row:
         conn.close(); raise HTTPException(404, "Research gap not found")
-    cur.execute("SELECT id FROM hive_gap_runs WHERE gap_id=%s AND status IN ('queued','scouting','harvesting','extracting','evaluating') ORDER BY id DESC LIMIT 1", (gap_id,))
+    cur.execute("SELECT id,child_mission_id FROM hive_gap_runs WHERE gap_id=%s AND status IN ('queued','scouting','harvesting','extracting','evaluating') ORDER BY id DESC LIMIT 1", (gap_id,))
     active = cur.fetchone(); conn.close()
     if active:
-        raise HTTPException(409, f"Gap already has active run {active[0]}")
+        proc = _gap_processes.get(active[0])
+        if proc and proc.returncode is None:
+            raise HTTPException(409, f"Gap already has active run {active[0]}")
+        # The durable checkpoint can outlive an API/container restart. Resume
+        # the same run and child mission instead of leaving a false-active row.
+        from behive.engine.deepening import update_run
+        update_run(active[0], "queued", "Recovered after worker interruption; waiting for bounded research slot")
+        asyncio.create_task(_run_gap_deepening(active[0], mission_id, gap_id, active[1], row[0]))
+        return {"run_id": active[0], "gap_id": gap_id, "child_mission_id": active[1],
+                "status": "queued", "resumed": True}
     child_id = f"gap_{mission_id[-10:]}_{gap_id}_{int(time.time())}"
     run_id = create_run(gap_id, mission_id, child_id)
     asyncio.create_task(_run_gap_deepening(run_id, mission_id, gap_id, child_id, row[0]))
@@ -1912,6 +1927,13 @@ async def _run_recovery(mission_id: str, stage: str):
 
 
 async def _run_gap_deepening(run_id: int, parent_id: str, gap_id: int, child_id: str, question: str):
+    """Bound concurrent deepening so one investigation cannot exhaust the app."""
+    limiter = _gap_semaphores.setdefault(parent_id, asyncio.Semaphore(1))
+    async with limiter:
+        await _run_gap_deepening_inner(run_id, parent_id, gap_id, child_id, question)
+
+
+async def _run_gap_deepening_inner(run_id: int, parent_id: str, gap_id: int, child_id: str, question: str):
     """Run a narrow child mission, merge only qualified evidence, and selectively re-analyze."""
     import sys
     from behive.engine.deepening import merge_qualified_evidence, save_revision, update_run
@@ -1922,11 +1944,12 @@ async def _run_gap_deepening(run_id: int, parent_id: str, gap_id: int, child_id:
                              "Avoid news aggregators and search-result summaries.")
         proc = await asyncio.create_subprocess_exec(
             sys.executable, "-m", "behive.engine", "run", targeted_question,
-            "--mission-id", child_id, "--depth", "4", "--scale", "40", "--force",
+            "--mission-id", child_id, "--depth", "3", "--scale", "12", "--force",
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
             env={**os.environ, "BEHIVE_MISSION_ID": child_id, "PYTHONUNBUFFERED": "1",
                  "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8",
-                 "BEHIVE_GAP_RUN_ID": str(run_id), "BEHIVE_REQUIRE_PRIMARY": "1"},
+                 "BEHIVE_GAP_RUN_ID": str(run_id), "BEHIVE_REQUIRE_PRIMARY": "1",
+                 "BEHIVE_TARGETED_PROBE": "1"},
         )
         _gap_processes[run_id] = proc
         output_tail = []

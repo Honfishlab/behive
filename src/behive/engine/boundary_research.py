@@ -124,7 +124,7 @@ query. A query that only changes generic words such as study, research, or revie
             query=probe.get('query') if isinstance(probe,dict) else str(probe)
             if query: probes.append((query,probe.get('source_family') if isinstance(probe,dict) else None))
         with ThreadPoolExecutor(max_workers=min(3,len(probes) or 1)) as pool:
-            futures={pool.submit(ingest_authority_sources,mission_id,query,8,family):(query,family) for query,family in probes}
+            futures={pool.submit(ingest_authority_sources,mission_id,query,8,family,False):(query,family) for query,family in probes}
             for future in as_completed(futures):
                 query,family=futures[future]
                 try: reports.append({'query':query,'source_family':family,'result':future.result()})

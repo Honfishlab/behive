@@ -293,7 +293,9 @@ def _nih_reporter(mission_id: str, topic: str, db, limit: int) -> dict:
     return {"registry":"nih_reporter","found":len(results),"saved":saved}
 
 
-def ingest_authority_sources(mission_id: str, topic: str, limit: int = 25, source_family: str | None = None) -> dict:
+def ingest_authority_sources(mission_id: str, topic: str, limit: int = 25,
+                             source_family: str | None = None,
+                             expand_queries: bool = True) -> dict:
     """Ingest registry-verified records and usable text before broad web discovery."""
     db = connect()
     _ensure_schema(db)
@@ -308,7 +310,12 @@ def ingest_authority_sources(mission_id: str, topic: str, limit: int = 25, sourc
     }
     selected=routes.get(source_family) or (("Europe PMC",_europe_pmc),("Crossref",_crossref),("PubMed",_pubmed),("OpenAlex",_openalex))
     reports, errors = [], []
-    families = build_query_families(topic)
+    # Boundary research already supplies carefully targeted probes. Expanding
+    # those probes again creates a registry/query cross-product and can exhaust
+    # both the API worker pool and PostgreSQL. Only broad mission topics fan out.
+    families = build_query_families(topic) if expand_queries else [
+        {"purpose": "targeted_probe", "query": topic}
+    ]
     # Query families prevent one broad natural-language query from determining
     # the entire corpus. Admission still uses the canonical mission topic.
     per_query = max(3, min(8, limit // max(1, len(families))))

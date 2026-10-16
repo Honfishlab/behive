@@ -66,3 +66,21 @@ def test_regulatory_routes_to_trial_and_funding_registries():
     trials.assert_called_once()
     reporter.assert_called_once()
     crossref.assert_not_called()
+
+
+def test_targeted_probe_is_not_expanded_again():
+    db = DB()
+    report = {"registry": "test", "found": 1, "saved": 1}
+    query = "NAD+ homeostasis in ALS motor neurons"
+    with patch.object(authority, "connect", return_value=db), \
+         patch.object(authority, "_ensure_schema"), \
+         patch.object(authority, "_europe_pmc", return_value=report) as pmc, \
+         patch.object(authority, "_pubmed", return_value=report) as pubmed:
+        result = authority.ingest_authority_sources(
+            "mission", query, 8, "primary_study", expand_queries=False
+        )
+
+    pmc.assert_called_once_with("mission", query, db, 8)
+    pubmed.assert_called_once_with("mission", query, db, 8)
+    assert len(result["registries"]) == 2
+    assert all(item["purpose"] == "targeted_probe" for item in result["registries"])

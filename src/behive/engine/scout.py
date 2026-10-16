@@ -4,6 +4,7 @@ import logging
 log = logging.getLogger(__name__)
 
 import sys
+import os
 import asyncio
 import json
 import re
@@ -739,7 +740,10 @@ def main() -> None:
     scout = SwarmScout(mission_id, topic)
     try:
         from behive.engine.authority import ingest_authority_sources
-        authority = ingest_authority_sources(mission_id, topic)
+        authority = ingest_authority_sources(
+            mission_id, topic,
+            expand_queries=os.environ.get("BEHIVE_TARGETED_PROBE") != "1",
+        )
         log.info("[authority] %s verified, %s evidence-ready, %s tier-one",
                  authority["verified_sources"], authority["evidence_ready"], authority["tier_one"])
     except Exception as exc:

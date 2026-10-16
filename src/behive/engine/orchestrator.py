@@ -1744,7 +1744,10 @@ def _run_pipeline_phases(mission_id: str, topic: str, plan: list, timings: dict,
     # from becoming the mission's entire evidence corpus.
     try:
         from behive.engine.authority import ingest_authority_sources
-        authority_report = ingest_authority_sources(mission_id, topic, limit=min(20, max(8, scale // 10)))
+        authority_report = ingest_authority_sources(
+            mission_id, topic, limit=min(20, max(8, scale // 10)),
+            expand_queries=os.environ.get("BEHIVE_TARGETED_PROBE") != "1",
+        )
         _con = _connect_db(read_only=True)
         _n_sources = _con.execute(
             "SELECT COUNT(*) FROM hive_sources WHERE mission_id=?", [mission_id]
