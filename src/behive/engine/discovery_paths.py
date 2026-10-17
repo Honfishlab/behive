@@ -8,8 +8,15 @@ from hashlib import sha1
 
 from behive.engine.db import connect
 
-PATH_TYPES = ("mechanism", "boundary", "modifier", "contradiction", "translation",
-              "combination", "measurement", "missing_link", "replication")
+PATH_TYPES = (
+    "adjacent_system", "downstream_consequence", "cross_domain", "intervention_opportunity",
+    "convergence", "scale_shift", "emerging_signal", "population_context",
+    "unexplained_link", "practical_direction", "mechanism", "boundary", "modifier",
+    "contradiction", "translation", "combination", "measurement", "missing_link", "replication",
+)
+MAX_ACTIVE_PATHS = 6
+EXPLORATION_STRATEGY_VERSION = 2
+NARROW_REVIEW_TYPES = ("mechanism", "boundary", "contradiction", "translation", "measurement", "replication")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS hive_discovery_paths (
@@ -47,51 +54,122 @@ def _words(text: str) -> set[str]:
     return {w for w in re.findall(r"[a-z0-9-]{4,}", (text or "").lower()) if w not in stop}
 
 
-def _path_specs(claim: str, index: int) -> list[tuple[str, str, str]]:
+def _topic_label(topic: str) -> str:
+    value = " ".join((topic or "the main research topic").strip().rstrip("?").split())
+    value = re.sub(r"^(?:how|what|which|why|when|where)\s+(?:does|do|did|is|are|can|could|might|will|would)\s+",
+                   "", value, flags=re.IGNORECASE)
+    return value[:220]
+
+
+def _path_specs(claim: str, index: int, topic: str = "") -> list[tuple[str, str, str]]:
+    """Fan findings outward into a diverse frontier portfolio.
+
+    Validation still happens inside the evidence pipeline. Discovery paths are
+    deliberately optimized for reach: neighboring systems, consequences,
+    combinations, translations, and opportunities that a curious researcher
+    would inspect before narrowing back down.
+    """
     claim = claim.strip().rstrip(".")
-    primary = ("mechanism",
-        f"What mechanisms, intermediates, and conditions could explain the finding that {claim}?",
-        "Tests causal structure instead of treating the reported association as a finished answer.")
-    rotations = [
-        ("boundary", f"Under what populations, contexts, doses, or time scales does the finding fail or reverse: {claim}?",
-         "Locates the limits of generalization and conditions hidden by an aggregate result."),
-        ("contradiction", f"What credible observations contradict or offer an alternative explanation for: {claim}?",
-         "Actively searches for disconfirming evidence and confounding explanations."),
-        ("translation", f"How well does the finding translate across models, tissues, species, or human populations: {claim}?",
-         "Separates direct evidence from untested translation between research contexts."),
-        ("measurement", f"Could measurement choice, sampling, or analysis method account for the finding: {claim}?",
-         "Tests whether the observation is robust to how it was produced."),
-        ("replication", f"Which independent groups or authoritative datasets replicate the finding: {claim}?",
-         "Measures independence and reproducibility rather than citation volume."),
+    subject = _topic_label(topic)
+    observation = f'“{claim}”'
+    frontiers = [
+        ("adjacent_system", f"Which neighboring biological systems or processes could connect the observation {observation} to unexplored parts of {subject}?",
+         "Searches one conceptual step beyond the finding for overlooked biological neighbors."),
+        ("downstream_consequence", f"What downstream consequences could follow from the observation {observation}, and which might matter most for {subject}?",
+         "Follows the finding forward into effects that the current literature may not connect explicitly."),
+        ("cross_domain", f"What ideas from adjacent fields could open new ways to understand or use the observation {observation}?",
+         "Imports useful models from neighboring disciplines instead of staying inside one literature silo."),
+        ("intervention_opportunity", f"What compounds, behaviors, technologies, or environmental changes could influence the pathway implied by the observation {observation}?",
+         "Turns the finding into a broad opportunity search without assuming one preferred intervention."),
+        ("convergence", f"Where might the observation {observation} converge with other mechanisms, exposures, or risk factors in {subject} to create unexpected combined effects?",
+         "Looks for multi-factor interactions that isolated studies commonly miss."),
+        ("scale_shift", f"How could the observation {observation} connect molecular events to cells, tissues, whole-body function, or lived outcomes in {subject}?",
+         "Moves across levels of explanation to find missing links between laboratory and real-world observations."),
+        ("emerging_signal", f"What emerging datasets, technologies, or research communities point to new directions related to the observation {observation}?",
+         "Scans the edge of the field for weak signals and newly possible lines of inquiry."),
+        ("population_context", f"Which populations, life stages, disease stages, or physiological states could make the observation {observation} especially consequential for {subject}?",
+         "Broadens the people and contexts considered rather than optimizing only for an average effect."),
+        ("unexplained_link", f"What apparently separate findings about {subject} become connected if the observation {observation} is treated as a bridge?",
+         "Uses the finding to join disconnected islands in the evidence graph."),
+        ("practical_direction", f"What new prevention, diagnostic, monitoring, or treatment directions become plausible if the observation {observation} is important?",
+         "Explores practical possibilities while keeping them explicitly provisional."),
     ]
-    return [primary, rotations[index % len(rotations)]]
+    first = (index * 2) % len(frontiers)
+    return [frontiers[first], frontiers[(first + 1) % len(frontiers)]]
 
 
-def _plan(path_type: str, question: str, claim: str) -> dict:
+def _plan(path_type: str, question: str, claim: str, topic: str = "") -> dict:
     terms = sorted(_words(claim), key=len, reverse=True)[:6]
+    topic_terms = sorted(_words(topic), key=len, reverse=True)[:3]
+    query_terms = list(dict.fromkeys(topic_terms + terms[:4]))
+    suffixes = {
+        "adjacent_system": ("pathway network review", "related processes emerging research", "systems biology dataset"),
+        "downstream_consequence": ("downstream outcomes", "longitudinal observations", "clinical implications"),
+        "cross_domain": ("cross disciplinary analogy", "shared mechanism other fields", "novel conceptual model"),
+        "intervention_opportunity": ("interventions compounds technology", "modifiable factors", "therapeutic opportunities"),
+        "convergence": ("combined mechanisms interaction", "multi factor model", "synergy comorbidity exposure"),
+        "scale_shift": ("molecular cellular organism outcomes", "translational bridge", "multiscale model"),
+        "emerging_signal": ("emerging research dataset", "preprint conference patent", "new technology measurement"),
+        "population_context": ("population subgroup life stage", "disease stage phenotype", "precision medicine cohort"),
+        "unexplained_link": ("knowledge graph connection", "shared pathway disconnected findings", "latent relationship"),
+        "practical_direction": ("prevention diagnosis monitoring treatment", "clinical development", "real world application"),
+    }.get(path_type, ("primary study", "systematic review", "authoritative dataset"))
     return {
         "objective": question,
-        "queries": [" ".join(terms[:4] + [suffix]) for suffix in
-                    ("mechanism primary study", "systematic review", "contradictory results")],
-        "required_source_types": ["primary research", "systematic review", "authoritative dataset"],
-        "minimum_independent_sources": 3,
-        "support_criterion": "At least two independent sources with directly comparable observations.",
-        "refutation_criterion": "A credible direct observation under comparable conditions that reverses or nullifies the claim.",
-        "completion_criterion": "Three independent sources, one primary record, and an explicit boundary or mechanism.",
-        "abandonment_criterion": "Pause after three searches add no new direct evidence or only duplicate sources.",
-        "revisit_when": "A new primary study, dataset, contradiction, or materially different measurement appears.",
+        "queries": [" ".join(query_terms + [suffix]) for suffix in suffixes],
+        "required_source_types": ["primary research", "authoritative dataset", "high-quality synthesis", "adjacent-field literature"],
+        "minimum_independent_sources": 2,
+        "support_criterion": "Two credible observations establish a meaningful connection worth mapping or deepening.",
+        "refutation_criterion": "Evidence shows the proposed connection is biologically or contextually incompatible.",
+        "completion_criterion": "Map at least one evidence-linked connection, consequence, opportunity, or explicit unknown.",
+        "abandonment_criterion": "Pause after three distinct search angles produce only duplicates or no credible connection.",
+        "revisit_when": "A new dataset, technology, neighboring mechanism, population signal, or intervention appears.",
         "max_attempts": 3, "path_type": path_type,
+        "strategy": "frontier_fanout", "strategy_version": EXPLORATION_STRATEGY_VERSION,
     }
 
 
 def _explanations(claim: str) -> list[dict]:
     subject = claim.strip().rstrip(".")
     return [
-        {"type":"primary", "statement":f"The reported relationship is causal: {subject}.", "weight":.4},
-        {"type":"alternative", "statement":"A correlated upstream process explains both variables.", "weight":.25},
-        {"type":"context", "statement":"The effect is real only under the reported biological or experimental conditions.", "weight":.2},
-        {"type":"artifact", "statement":"Measurement, selection, or publication effects inflate the relationship.", "weight":.15},
+        {"type":"network", "statement":f"The observation may be one node in a wider biological network: {subject}.", "weight":.3},
+        {"type":"downstream", "statement":"The most important discovery may be a consequence several steps beyond the measured effect.", "weight":.25},
+        {"type":"context", "statement":"A population, life stage, exposure, or disease stage may reveal a stronger connection.", "weight":.25},
+        {"type":"opportunity", "statement":"A new measurement or intervention may make a previously hidden relationship observable.", "weight":.2},
     ]
+
+
+def retire_unstarted_narrow_paths(project_id: str) -> dict:
+    """Archive v1 review-style paths only when no research mission started.
+
+    This preserves completed/in-flight evidence while removing repetitive queued
+    questions that would otherwise crowd out the new frontier portfolio.
+    """
+    db = connect(); ensure_schema(db)
+    rows = db.execute(
+        "SELECT p.id,p.child_question_id FROM hive_discovery_paths p "
+        "LEFT JOIN hive_questions q ON q.id=p.child_question_id "
+        "WHERE p.project_id=? AND p.path_type=ANY(?) AND p.status IN ('proposed','queued') "
+        "AND COALESCE((p.research_plan->>'strategy_version')::integer,1) < ? "
+        "AND (p.child_question_id IS NULL OR NOT EXISTS (SELECT 1 FROM hive_missions m WHERE m.question_id=p.child_question_id))",
+        [project_id, list(NARROW_REVIEW_TYPES), EXPLORATION_STRATEGY_VERSION],
+    ).fetchall()
+    path_ids = [row[0] for row in rows]
+    question_ids = [row[1] for row in rows if row[1]]
+    if path_ids:
+        db.execute("UPDATE hive_discovery_paths SET status='deferred',outcome=?::jsonb,updated_at=NOW() WHERE id=ANY(?)",
+                   [json.dumps({"reason":"superseded by frontier-fanout strategy","strategy_version":2}), path_ids])
+    if question_ids:
+        db.execute("UPDATE hive_questions SET status='archived',updated_at=NOW() WHERE id=ANY(?) AND status IN ('open','queued','paused','evidence_boundary')",
+                   [question_ids])
+        db.execute(
+            "UPDATE hive_research_actions a SET status='superseded',completed_at=NOW(),error_message='Superseded by frontier-fanout discovery strategy' "
+            "FROM hive_research_branches b WHERE a.branch_id=b.id AND b.subject_id=ANY(?) "
+            "AND a.status IN ('queued','retrying')", [question_ids],
+        )
+        db.execute("UPDATE hive_research_branches SET status='satisfied',updated_at=NOW() WHERE subject_id=ANY(?)", [question_ids])
+    db.commit(); db.close()
+    return {"paths_deferred": len(path_ids), "questions_archived": len(question_ids)}
 
 
 def generate_paths(mission_id: str, project_id: str | None = None, limit: int = 12) -> dict:
@@ -102,6 +180,11 @@ def generate_paths(mission_id: str, project_id: str | None = None, limit: int = 
         project_id = row[0] if row else None
     if not project_id:
         db.close(); return {"generated":0, "reason":"Mission is not linked to a project"}
+    db.close()
+    retired = retire_unstarted_narrow_paths(project_id)
+    db = connect(); ensure_schema(db)
+    topic_row = db.execute("SELECT topic FROM hive_missions WHERE id=?", [mission_id]).fetchone()
+    topic = topic_row[0] if topic_row else ""
     rows = db.execute(
         "SELECT f.id,f.claim_id,f.question_id,f.summary,f.confidence,f.novelty "
         "FROM hive_findings f WHERE f.project_id=? AND f.status NOT IN ('contradicted','superseded') "
@@ -113,32 +196,34 @@ def generate_paths(mission_id: str, project_id: str | None = None, limit: int = 
     for index, (finding_id, claim_id, question_id, claim, confidence, novelty) in enumerate(rows):
         overlap = max((len(all_terms[index] & terms) / max(1, len(all_terms[index] | terms))
                        for j, terms in enumerate(all_terms) if j != index), default=0)
-        for path_type, question, rationale in _path_specs(claim, index):
+        for path_type, question, rationale in _path_specs(claim, index, topic):
             uncertainty = max(.2, 1-float(confidence or .5))
             impact = min(1, .55 + float(novelty or .5)*.35)
             connection = min(1, .35 + overlap)
-            testability = .82 if path_type in ("mechanism","boundary","measurement","replication") else .7
-            availability = .78 if path_type in ("replication","contradiction") else .65
-            cost = .35 if path_type in ("replication","measurement") else .5
+            testability = .68
+            availability = .72 if path_type in ("adjacent_system","cross_domain","emerging_signal") else .65
+            cost = .42 if path_type in ("emerging_signal","unexplained_link") else .5
             duplication = overlap*.45
-            score = round(.23*uncertainty+.22*impact+.2*connection+.17*testability+
-                          .13*availability-.03*cost-.12*duplication, 4)
+            score = round(.16*uncertainty+.25*impact+.29*connection+.1*testability+
+                          .13*availability-.03*cost-.10*duplication, 4)
             path_id = "dp_" + sha1(f"{project_id}|{finding_id}|{path_type}".encode()).hexdigest()[:18]
             result = db.execute(
                 "INSERT INTO hive_discovery_paths (id,mission_id,project_id,finding_id,claim_id,source_question_id,"
                 "path_type,question,rationale,uncertainty,impact,connection_value,testability,source_availability,"
                 "cost,duplication,discovery_score,competing_explanations,research_plan) "
                 "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?::jsonb,?::jsonb) "
-                "ON CONFLICT (project_id,finding_id,path_type) DO UPDATE SET rationale=EXCLUDED.rationale,"
-                "discovery_score=EXCLUDED.discovery_score,research_plan=EXCLUDED.research_plan,updated_at=NOW() "
+                "ON CONFLICT (project_id,finding_id,path_type) DO UPDATE SET question=EXCLUDED.question,"
+                "rationale=EXCLUDED.rationale,discovery_score=EXCLUDED.discovery_score,"
+                "competing_explanations=EXCLUDED.competing_explanations,"
+                "research_plan=EXCLUDED.research_plan,updated_at=NOW() "
                 "RETURNING id",
                 [path_id,mission_id,project_id,finding_id,claim_id,question_id,path_type,question,rationale,
                  uncertainty,impact,connection,testability,availability,cost,duplication,score,
-                 json.dumps(_explanations(claim)),json.dumps(_plan(path_type,question,claim))],
+                 json.dumps(_explanations(claim)),json.dumps(_plan(path_type,question,claim,topic))],
             ).fetchone()
             generated += bool(result)
     db.commit(); db.close()
-    return {"mission_id":mission_id,"project_id":project_id,"generated":generated}
+    return {"mission_id":mission_id,"project_id":project_id,"generated":generated,"retired":retired}
 
 
 def activate_path(path_id: str) -> dict:
@@ -177,10 +262,17 @@ def activate_ranked(mission_id: str, limit: int = 3, require_continuous: bool = 
         policy = policy[0] if policy and policy[0] else {}
         if policy.get("autonomy") != "continuous" or policy.get("status") != "running":
             db.close(); return {"activated":0,"reason":"Continuous policy is paused"}
+    active = db.execute(
+        "SELECT COUNT(*) FROM hive_discovery_paths WHERE mission_id=? AND status IN ('queued','running')",
+        [mission_id],
+    ).fetchone()[0]
+    available = max(0, min(max(1, limit), MAX_ACTIVE_PATHS) - int(active or 0))
+    if not available:
+        db.close(); return {"activated":0,"reason":"Active discovery-path limit reached","active":int(active or 0)}
     rows = db.execute(
         "SELECT id FROM hive_discovery_paths WHERE mission_id=? AND status='proposed' "
         "AND discovery_score>=.45 ORDER BY discovery_score DESC,created_at LIMIT ?",
-        [mission_id, max(1, min(limit, 10))],
+        [mission_id, available],
     ).fetchall(); db.close()
     activated = [activate_path(row[0]) for row in rows]
     return {"activated":len(activated),"paths":activated}
