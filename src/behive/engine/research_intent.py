@@ -117,7 +117,13 @@ def assess_relevance(topic: str, title: str, abstract: str = "") -> dict:
     specific_context = bool({"als", "neurodegeneration"}.intersection(context_hits))
     contextual_support = (not intent.contexts or specific_context or len(context_hits) >= 2
                           or (bool(title_entity_hits) and bool(context_hits)))
-    accepted = bool(entity_hits) and not excluded and contextual_support
+    # Compound questions need intersection evidence.  A paper about only NAD,
+    # or only gold nanoparticles, may inspire a child path but cannot support
+    # the parent mechanism and must not enter its evidence corpus.
+    complete_entity_match = bool(entity_hits) and (
+        len(intent.primary_entities) == 1 or len(entity_hits) == len(intent.primary_entities)
+    )
+    accepted = complete_entity_match and not excluded and contextual_support
     return {"accepted": accepted, "score": round(score, 4), "entity_hits": entity_hits,
             "title_entity_hits": title_entity_hits, "context_hits": context_hits,
             "entity_ratio": round(entity_ratio, 4),

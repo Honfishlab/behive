@@ -68,6 +68,17 @@ def test_corpus_about_only_nad_is_retrieval_inadequate_for_gold_nad_topic():
     assert "gold nanoparticle" in result["missing_entities"]
 
 
+def test_single_side_source_is_not_admitted_to_compound_mission():
+    topic = "Can 5nm gold particles catalyze NADH to NAD+ in the brain and CNS?"
+    result = assess_relevance(
+        topic,
+        "Highly sensitive cocaine detection on an AuNP electrode",
+        "Gold nanoparticles support catalytic redox recycling.",
+    )
+    assert not result["accepted"]
+    assert result["entity_hits"] == ["gold nanoparticle"]
+
+
 def test_joint_gold_nad_corpus_is_adequate():
     topic = "Can 5nm gold particles catalyze NADH to NAD+ in the brain and CNS?"
     records = [
