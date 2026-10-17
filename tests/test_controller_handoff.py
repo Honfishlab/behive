@@ -150,3 +150,52 @@ def test_question_sync_does_not_reactivate_evidence_found():
             return self.row
 
     assert controller._sync_branches(SyncDB(), "root_mission") == 0
+
+
+def test_promote_supported_project_findings_repairs_missing_handoff():
+    class Rows(Result):
+        def fetchall(self):
+            return self.row
+
+    class PromoteDB:
+        def __init__(self):
+            self.insert_sql = ""
+
+        def execute(self, sql, params=None):
+            normalized = " ".join(sql.split())
+            if normalized.startswith("SELECT project_id FROM hive_missions"):
+                return Result(("project_1",))
+            if normalized.startswith("INSERT INTO hive_findings"):
+                self.insert_sql = normalized
+                assert params == ["project_1"]
+                return Rows([(1,), (2,)])
+            raise AssertionError(normalized)
+
+    db = PromoteDB()
+    assert controller._promote_supported_project_findings(db, "mission_1") == 2
+    assert "integrity_status='supported'" in db.insert_sql
+    assert "COALESCE(c.is_garbage,FALSE)=FALSE" in db.insert_sql
+
+
+def test_stale_running_action_is_requeued_after_worker_restart():
+    class Rows(Result):
+        def fetchall(self):
+            return self.row
+
+    class RecoveryDB:
+        def __init__(self):
+            self.calls = []
+
+        def execute(self, sql, params=None):
+            normalized = " ".join(sql.split())
+            self.calls.append((normalized, params or []))
+            if normalized.startswith("SELECT id,branch_id FROM hive_research_actions"):
+                assert params == ["mission_1", controller.STALE_ACTION_MINUTES]
+                return Rows([(9, "branch_1")])
+            return Result()
+
+    db = RecoveryDB()
+    assert controller._recover_stale_actions(db, "mission_1") == 1
+    updates = [sql for sql, _ in db.calls if sql.startswith("UPDATE")]
+    assert any("status='retrying'" in sql for sql in updates)
+    assert any("Controller worker restarted" in sql for sql in updates)

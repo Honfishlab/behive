@@ -22,6 +22,7 @@ log = logging.getLogger(__name__)
 MAX_ACTIVE_BRANCHES = 40
 MAX_PENDING_ACTIONS = 40
 MIN_OLDEST_ACTIONS = 15
+STALE_ACTION_MINUTES = 35
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS hive_research_branches (
@@ -124,13 +125,70 @@ def _fingerprint(branch_id: str, action_type: str, generation: int) -> str:
 
 
 def _snapshot(db, mission_id: str) -> dict:
+    project = db.execute("SELECT project_id FROM hive_missions WHERE id=?", [mission_id]).fetchone()
+    mission_ids = [mission_id]
+    if project and project[0]:
+        mission_ids = [row[0] for row in db.execute(
+            "SELECT id FROM hive_missions WHERE project_id=?", [project[0]]
+        ).fetchall()] or mission_ids
     counts = {}
     for key, table in (("sources", "hive_sources"), ("documents", "hive_content"),
                        ("findings", "hive_claims"), ("nodes", "hive_discovery_nodes"),
                        ("edges", "hive_discovery_edges"), ("frontiers", "hive_frontiers"),
                        ("hypotheses", "hive_hypothesis_paths")):
-        counts[key] = db.execute(f"SELECT COUNT(*) FROM {table} WHERE mission_id=?", [mission_id]).fetchone()[0]
+        counts[key] = db.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE mission_id=ANY(?)", [mission_ids]
+        ).fetchone()[0]
     return counts
+
+
+def _promote_supported_project_findings(db, mission_id: str) -> int:
+    """Repair the claim-to-finding handoff for every linked project mission.
+
+    Older/root runs and interrupted controller runs can contain citation-audited
+    claims without a project finding row. Discovery paths intentionally consume
+    only the project ledger, so leaving that gap makes a successful mission look
+    like it discovered nothing.
+    """
+    project = db.execute("SELECT project_id FROM hive_missions WHERE id=?", [mission_id]).fetchone()
+    project_id = project[0] if project else None
+    if not project_id:
+        return 0
+    rows = db.execute(
+        "INSERT INTO hive_findings (project_id,question_id,claim_id,source_url,summary,confidence,novelty,status) "
+        "SELECT m.project_id,m.question_id,c.id,c.source_url,c.claim,c.confidence,COALESCE(c.quality_score,.5),'supported' "
+        "FROM hive_claims c JOIN hive_missions m ON m.id=c.mission_id "
+        "WHERE m.project_id=? AND m.question_id IS NOT NULL "
+        "AND c.integrity_status='supported' AND COALESCE(c.is_garbage,FALSE)=FALSE "
+        "AND NOT EXISTS (SELECT 1 FROM hive_findings f WHERE f.project_id=m.project_id AND f.claim_id=c.id) "
+        "RETURNING id", [project_id]
+    ).fetchall()
+    return len(rows)
+
+
+def _recover_stale_actions(db, mission_id: str) -> int:
+    """Return orphaned controller work to the durable queue after a restart.
+
+    A controller worker has a hard 30 minute timeout. A running row older than
+    35 minutes therefore cannot still be healthy. Requeueing preserves its
+    attempt count and lets the idempotent child mission recovery path finish it.
+    """
+    rows = db.execute(
+        "SELECT id,branch_id FROM hive_research_actions WHERE mission_id=? "
+        "AND status='running' AND started_at < NOW()-(?||' minutes')::interval",
+        [mission_id, STALE_ACTION_MINUTES],
+    ).fetchall()
+    for action_id, branch_id in rows:
+        db.execute(
+            "UPDATE hive_research_actions SET status='retrying',next_attempt_at=NOW(),"
+            "error_message='Recovered orphaned running action after worker restart' WHERE id=?",
+            [action_id],
+        )
+        db.execute(
+            "UPDATE hive_research_branches SET status='watching',reason='Controller worker restarted; resuming from durable child mission',"
+            "updated_at=NOW() WHERE id=?", [branch_id],
+        )
+    return len(rows)
 
 
 def _record_change(db, mission_id: str, change_type: str, headline: str, detail: str,
@@ -541,6 +599,17 @@ def reconcile(mission_id: str, trigger: str = "controller") -> dict:
     db = connect(); ensure_schema(db)
     mission_id = _controller_anchor(db, mission_id)
     _retire_child_controllers(db, mission_id)
+    recovered = _recover_stale_actions(db, mission_id)
+    promoted = _promote_supported_project_findings(db, mission_id)
+    project_row = db.execute("SELECT project_id FROM hive_missions WHERE id=?", [mission_id]).fetchone()
+    project_id = project_row[0] if project_row else None
+    db.commit()
+    # Keep the path ledger derived from the evidence ledger on every controller
+    # reconciliation. Both operations are idempotent, so deployment/restart gaps
+    # repair themselves instead of requiring a special backfill command.
+    from behive.engine.discovery_paths import generate_paths, activate_ranked
+    path_result = generate_paths(mission_id, project_id) if project_id else {"generated": 0}
+    activation = activate_ranked(mission_id, limit=3, require_continuous=True) if project_id else {"activated": 0}
     before_row = db.execute(
         "SELECT after_state FROM hive_research_changes WHERE mission_id=? AND change_type='snapshot' "
         "ORDER BY id DESC LIMIT 1", [mission_id]
@@ -606,6 +675,9 @@ def reconcile(mission_id: str, trigger: str = "controller") -> dict:
         queued += 1
     db.commit(); db.close()
     return {"mission_id": mission_id, "branches_synced": synced, "actions_queued": queued, "queue": queue,
+            "stale_actions_recovered": recovered, "findings_promoted": promoted,
+            "paths_generated": path_result.get("generated", 0),
+            "paths_activated": activation.get("activated", 0),
             "before": before, "after": after}
 
 
