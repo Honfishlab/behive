@@ -1209,6 +1209,26 @@ Return {{"claims": []}} if nothing is supported.
     return saved
 
 
+def _retrieval_adequacy(mission_id: str) -> dict:
+    """Measure whether the retrieved corpus represents every named subject."""
+    from behive.engine.research_intent import assess_corpus_adequacy
+    con = _connect_db(read_only=True)
+    try:
+        topic = con.execute("SELECT topic FROM hive_missions WHERE id=?", [mission_id]).fetchone()[0]
+        rows = con.execute(
+            "SELECT COALESCE(title,''),COALESCE(snippet,'') FROM hive_sources WHERE mission_id=?",
+            [mission_id],
+        ).fetchall()
+    finally:
+        con.close()
+    return assess_corpus_adequacy(topic, [{"title": row[0], "abstract": row[1]} for row in rows])
+
+
+def _classify_no_claim_outcome(mission_id: str, default_code: str) -> str:
+    adequacy = _retrieval_adequacy(mission_id)
+    return default_code if adequacy["adequate"] else "retrieval_inadequate"
+
+
 def _record_insufficient_evidence(mission_id: str, document_count: int,
                                   outcome_code: str = "genuine_evidence_boundary") -> dict:
     """Persist a truthful no-evidence result instead of reporting a pipeline crash."""
@@ -1231,10 +1251,20 @@ def _record_insufficient_evidence(mission_id: str, document_count: int,
     finally:
         con.close()
     method_summary = ", ".join(f"{name}: {count}" for name, count in methods) or "none"
+    adequacy = _retrieval_adequacy(mission_id)
+    retrieval_failed = outcome_code == "retrieval_inadequate"
+    depth_status = "retrieval_inadequate" if retrieval_failed else "insufficient"
+    assessment = (
+        f"The system retrieved {document_count} records, but the corpus did not preserve all required concepts "
+        f"({', '.join(adequacy['required_entities']) or 'the stated subject'}). This is a retrieval failure, not "
+        "evidence that the literature has no findings. A diversified authority search is required."
+        if retrieval_failed else
+        f"The system found {document_count} candidate records but could not extract any defensible, "
+        "source-linked findings for this question. No substantive conclusion should be drawn yet."
+    )
     analysis = {
-        "depth_status": "insufficient",
-        "executive_assessment": (f"The system found {document_count} candidate records but could not extract any defensible, "
-                                 "source-linked findings for this question. No substantive conclusion should be drawn yet."),
+        "depth_status": depth_status,
+        "executive_assessment": assessment,
         "rankings": [], "mechanisms": [], "agreements": [], "contradictions": [], "scenarios": [], "deductions": [],
         "limitations": [
             "No claim met the minimum evidence threshold.",
@@ -1243,6 +1273,7 @@ def _record_insufficient_evidence(mission_id: str, document_count: int,
         ],
         "research_gaps": [{"question": q, "priority": p, "why": "Required to obtain full-text, primary or peer-reviewed evidence."}
                           for q, p in gaps],
+        "retrieval_adequacy": adequacy,
         "evidence_metrics": {"claims": 0, "cited_sources": 0, "documents_reviewed": document_count,
                              "full_text_sources": cited, "generated_at": datetime.utcnow().isoformat()},
     }
@@ -1257,14 +1288,14 @@ def _record_insufficient_evidence(mission_id: str, document_count: int,
         write_con.execute(
             "INSERT INTO hive_analysis (mission_id,analysis,depth_status,source_count,cited_source_count,claim_count,updated_at) "
             "VALUES (?,?,?,?,0,0,NOW()) ON CONFLICT(mission_id) DO UPDATE SET analysis=EXCLUDED.analysis,"
-            "depth_status='insufficient',source_count=EXCLUDED.source_count,cited_source_count=0,claim_count=0,updated_at=NOW()",
-            [mission_id, json.dumps(analysis), 'insufficient', document_count],
+            "depth_status=EXCLUDED.depth_status,source_count=EXCLUDED.source_count,cited_source_count=0,claim_count=0,updated_at=NOW()",
+            [mission_id, json.dumps(analysis), depth_status, document_count],
         )
         write_con.execute(
-            "UPDATE hive_missions SET status='insufficient',phase='insufficient',synthesis=?,process_done_at=NOW(),"
+            "UPDATE hive_missions SET status='insufficient',phase=?,synthesis=?,process_done_at=NOW(),"
             "quality_metrics=COALESCE(quality_metrics,'{}'::jsonb)||jsonb_build_object("
             "'outcome','insufficient_evidence','outcome_code',?,'documents_reviewed',?) WHERE id=?",
-            [report, outcome_code, document_count, mission_id],
+            [depth_status, report, outcome_code, document_count, mission_id],
         )
         write_con.commit()
     finally:
@@ -1893,7 +1924,8 @@ def _run_pipeline_phases(mission_id: str, topic: str, plan: list, timings: dict,
             _emit(mission_id, 'process', 'fallback_completed', data={'claims': _claims_after_process})
         else:
             log.warning("No defensible findings after both extraction strategies; recording insufficient evidence")
-            outcome = _record_insufficient_evidence(mission_id, _n_harvested, "extractor_no_supported_claims")
+            code = _classify_no_claim_outcome(mission_id, "extractor_no_supported_claims")
+            outcome = _record_insufficient_evidence(mission_id, _n_harvested, code)
             _emit(mission_id, 'process', 'insufficient_evidence', data=outcome)
             try:
                 from behive.engine.frontier import run_frontier_cycle
@@ -1919,7 +1951,8 @@ def _run_pipeline_phases(mission_id: str, topic: str, plan: list, timings: dict,
         log.error("Topic-integrity gate failed: %s", _integrity_error)
         raise RuntimeError(f"Claim integrity gate failed: {_integrity_error}") from _integrity_error
     if _claims_after_process <= 0:
-        outcome = _record_insufficient_evidence(mission_id, _n_harvested, "claims_rejected_by_relevance")
+        code = _classify_no_claim_outcome(mission_id, "claims_rejected_by_relevance")
+        outcome = _record_insufficient_evidence(mission_id, _n_harvested, code)
         _emit(mission_id, 'process', 'insufficient_evidence', data=outcome)
         return
 
@@ -2426,7 +2459,8 @@ def cmd_process(mission_id: str) -> None:
         claim_count = _fallback_extract_claims(mission_id)
     if claim_count == 0:
         log.warning("No defensible findings; recording an insufficient-evidence outcome instead of a pipeline failure")
-        _record_insufficient_evidence(mission_id, content_count, "extractor_no_supported_claims")
+        code = _classify_no_claim_outcome(mission_id, "extractor_no_supported_claims")
+        _record_insufficient_evidence(mission_id, content_count, code)
         try:
             from behive.engine.frontier import run_frontier_cycle
             discovery = run_frontier_cycle(mission_id, trigger="insufficient_evidence")

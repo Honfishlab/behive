@@ -11,6 +11,8 @@ from dataclasses import asdict, dataclass, field
 
 _ALIASES = {
     "nad": ["nad", "nad+", "nadh", "nad(h)", "nicotinamide adenine dinucleotide"],
+    "gold nanoparticle": ["gold nanoparticle", "gold nanoparticles", "gold particle", "gold particles", "gold nanomaterial",
+                          "gold nanomaterials", "aunp", "au nps", "colloidal gold", "nanogold"],
     "oxaloacetate": ["oxaloacetate", "oxaloacetic acid", "oaa"],
     "tdp-43": ["tdp-43", "tdp43", "tardbp", "tar dna-binding protein 43"],
     "mycelium": ["mycelium", "mycelial", "fungal mycelium"],
@@ -25,6 +27,9 @@ _CONTEXT_ALIASES = {
     "aggregation": ["aggregation", "aggregate", "misfold"],
     "fermentation": ["ferment"],
     "nutrition": ["nutrient", "nutrition", "digestib", "antinutr"],
+    "cns": ["brain", "central nervous system", "cns", "blood brain barrier", "bbb"],
+    "catalysis": ["cataly", "nanozyme", "oxidation", "redox", "electron transfer"],
+    "particle_size": ["5 nm", "5nm", "nanometer", "particle size"],
 }
 _GENERIC = {
     "implication", "implications", "function", "functions", "body", "substance",
@@ -115,20 +120,67 @@ def assess_relevance(topic: str, title: str, abstract: str = "") -> dict:
     accepted = bool(entity_hits) and not excluded and contextual_support
     return {"accepted": accepted, "score": round(score, 4), "entity_hits": entity_hits,
             "title_entity_hits": title_entity_hits, "context_hits": context_hits,
+            "entity_ratio": round(entity_ratio, 4),
+            "all_entities_present": bool(intent.primary_entities) and len(entity_hits) == len(intent.primary_entities),
             "excluded_senses": excluded, "intent": intent.to_dict()}
+
+
+def assess_corpus_adequacy(topic: str, records: list[dict]) -> dict:
+    """Decide whether retrieval represents the actual compound research intent.
+
+    A large pile of papers about only one half of a multi-entity question is not
+    evidence of absence.  It is a retrieval failure and must be re-scouted.
+    """
+    intent = build_intent(topic)
+    checks = [assess_relevance(topic, row.get("title", ""), row.get("abstract", ""))
+              for row in records]
+    relevant = [item for item in checks if item["accepted"] and item["score"] >= .55]
+    joint = [item for item in relevant if item["all_entities_present"]]
+    covered = sorted({hit for item in relevant for hit in item["entity_hits"]})
+    required = [item["canonical"] for item in intent.primary_entities]
+    enough_relevant = len(relevant) >= min(3, max(1, len(records)))
+    enough_joint = len(required) < 2 or len(joint) >= 1
+    adequate = bool(records) and enough_relevant and enough_joint
+    return {
+        "adequate": adequate,
+        "records": len(records),
+        "relevant_records": len(relevant),
+        "joint_entity_records": len(joint),
+        "required_entities": required,
+        "covered_entities": covered,
+        "missing_entities": [value for value in required if value not in covered],
+        "reason": ("adequate" if adequate else
+                   "no records retrieved" if not records else
+                   "compound topic was split during retrieval" if len(required) >= 2 and not joint else
+                   "too few topically relevant records"),
+    }
 
 
 def build_query_families(topic: str) -> list[dict]:
     intent = build_intent(topic)
     if not intent.primary_entities:
         return [{"purpose": "original", "query": topic}]
-    entity = intent.primary_entities[0]
-    subject = f'"{entity["aliases"][0]}"'
-    if entity["canonical"] == "nad":
-        subject = '("NAD+" OR "nicotinamide adenine dinucleotide" OR NADH)'
+    def subject_for(entity: dict) -> str:
+        if entity["canonical"] == "nad":
+            return '("NAD+" OR "nicotinamide adenine dinucleotide" OR NADH)'
+        if entity["canonical"] == "gold nanoparticle":
+            return '("gold nanoparticle" OR AuNP OR "colloidal gold")'
+        return f'"{entity["aliases"][0]}"'
+
+    subjects = [subject_for(entity) for entity in intent.primary_entities]
+    subject = " ".join(subjects)
     contexts = [c["canonical"] for c in intent.contexts]
     families = [{"purpose": "overview", "query": f"{subject} review mechanism"}]
     families += [{"purpose": value, "query": f"{subject} {value}"} for value in contexts[:5]]
+    canonicals = {entity["canonical"] for entity in intent.primary_entities}
+    if {"nad", "gold nanoparticle"}.issubset(canonicals):
+        families += [
+            {"purpose": "direct catalysis", "query": f'{subject} NADH oxidation catalysis nanozyme'},
+            {"purpose": "size constraint", "query": f'{subject} "5 nm" particle size'},
+            {"purpose": "CNS delivery", "query": f'{subject} brain CNS blood-brain barrier biodistribution'},
+            {"purpose": "measured outcome", "query": f'{subject} intracellular NAD+/NADH ratio measurement'},
+            {"purpose": "safety", "query": f'{subject} neurotoxicity aggregation dose'},
+        ]
     if "als" in contexts:
         families.append({"purpose": "human evidence", "query": f"{subject} ALS clinical trial"})
         families.append({"purpose": "intervention", "query": f"{subject} precursor ALS NR NMN"})

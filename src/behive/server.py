@@ -623,9 +623,9 @@ async def recover_research(mission_id: str):
         insufficient = row[2] == "insufficient" or (row[1] or {}).get("outcome") == "insufficient_evidence"
         outcome_code = (row[1] or {}).get("outcome_code", "")
         recovery_by_outcome = {
-            "retrieval_failed": "scout", "sources_off_topic": "scout",
+            "retrieval_failed": "scout", "retrieval_inadequate": "scout", "sources_off_topic": "scout",
             "harvest_failed": "harvest", "full_text_unavailable": "harvest",
-            "extractor_unavailable": "process", "extractor_no_supported_claims": "process",
+            "extractor_unavailable": "process", "extractor_no_supported_claims": "scout",
             "claims_rejected_by_relevance": "process", "citation_integrity_failed": "process",
             "genuine_evidence_boundary": "scout",
         }
