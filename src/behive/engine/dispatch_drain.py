@@ -35,13 +35,13 @@ def pause_dispatch(drain_id: str, db=None) -> dict:
         paused = db.execute(
             "UPDATE hive_projects SET agent_policy=agent_policy || jsonb_build_object('status','paused'),"
             "updated_at=NOW() WHERE id IN (SELECT project_id FROM hive_dispatch_drain_snapshot "
-            "WHERE drain_id=? AND restored_at IS NULL)", [drain_id],
-        ).rowcount
+            "WHERE drain_id=? AND restored_at IS NULL) RETURNING id", [drain_id],
+        ).fetchall()
         active_after = db.execute(
             "SELECT COUNT(*) FROM hive_research_actions WHERE status='running'"
         ).fetchone()[0]
         db.commit()
-        return {"drain_id": drain_id, "paused_projects": paused,
+        return {"drain_id": drain_id, "paused_projects": len(paused),
                 "active_before": active_before, "active_after": active_after}
     finally:
         if owns:
@@ -57,14 +57,14 @@ def restore_dispatch(drain_id: str, db=None) -> dict:
         restored = db.execute(
             "UPDATE hive_projects p SET agent_policy=s.agent_policy,updated_at=NOW() "
             "FROM hive_dispatch_drain_snapshot s WHERE s.drain_id=? AND s.project_id=p.id "
-            "AND s.restored_at IS NULL", [drain_id],
-        ).rowcount
+            "AND s.restored_at IS NULL RETURNING p.id", [drain_id],
+        ).fetchall()
         db.execute(
             "UPDATE hive_dispatch_drain_snapshot SET restored_at=NOW() "
             "WHERE drain_id=? AND restored_at IS NULL", [drain_id],
         )
         db.commit()
-        return {"drain_id": drain_id, "restored_projects": restored}
+        return {"drain_id": drain_id, "restored_projects": len(restored)}
     finally:
         if owns:
             db.close()

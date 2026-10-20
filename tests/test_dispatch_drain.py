@@ -2,8 +2,9 @@ from behive.engine.dispatch_drain import pause_dispatch, restore_dispatch
 
 
 class Result:
-    def __init__(self, value=0, rowcount=0): self.value, self.rowcount = value, rowcount
+    def __init__(self, value=0, rows=None): self.value, self.rows = value, rows or []
     def fetchone(self): return (self.value,)
+    def fetchall(self): return self.rows
 
 
 class DB:
@@ -11,7 +12,7 @@ class DB:
     def execute(self, sql, params=None):
         self.calls.append((sql, params))
         if "COUNT(*)" in sql: return Result(next(self.counts))
-        if "UPDATE hive_projects" in sql: return Result(rowcount=5)
+        if "UPDATE hive_projects" in sql: return Result(rows=[(str(i),) for i in range(5)])
         return Result()
     def commit(self): self.commits += 1
 
