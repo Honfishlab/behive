@@ -141,6 +141,12 @@ async def _continuous_discovery_loop():
         try:
             from behive.engine.frontier import ensure_schema
             await asyncio.to_thread(ensure_schema)
+            # Repair expired workers before the NOT EXISTS(running) eligibility
+            # gate.  Reconcile cannot repair a mission that this gate excludes.
+            from behive.engine.controller import recover_stale_actions
+            recovered = await asyncio.to_thread(recover_stale_actions)
+            if recovered:
+                print(f"Continuous discovery scheduler recovered {recovered} stale action(s)")
             conn = get_db(); cur = conn.cursor()
             cur.execute("""
                 SELECT DISTINCT ON (p.id) m.id,p.cadence_minutes

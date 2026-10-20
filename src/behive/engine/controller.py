@@ -12,6 +12,8 @@ import logging
 import os
 import subprocess
 import sys
+import threading
+from contextlib import contextmanager
 from urllib.parse import urlparse
 from datetime import datetime, timedelta
 from hashlib import sha1
@@ -46,6 +48,7 @@ CREATE TABLE IF NOT EXISTS hive_research_actions (
  payload JSONB DEFAULT '{}'::jsonb, result JSONB DEFAULT '{}'::jsonb,
  error_message TEXT, queued_at TIMESTAMP DEFAULT NOW(), started_at TIMESTAMP,
  completed_at TIMESTAMP, next_attempt_at TIMESTAMP,
+ heartbeat_at TIMESTAMP,
  UNIQUE(mission_id,fingerprint)
 );
 CREATE TABLE IF NOT EXISTS hive_research_changes (
@@ -77,6 +80,7 @@ def ensure_schema(db=None) -> None:
     db.execute("ALTER TABLE hive_questions ADD COLUMN IF NOT EXISTS success_criteria JSONB DEFAULT '{}'::jsonb")
     db.execute("ALTER TABLE hive_questions ADD COLUMN IF NOT EXISTS attempts INTEGER DEFAULT 0")
     db.execute("ALTER TABLE hive_questions ADD COLUMN IF NOT EXISTS last_researched_at TIMESTAMPTZ")
+    db.execute("ALTER TABLE hive_research_actions ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMPTZ")
     if owned:
         db.close()
 
@@ -166,29 +170,73 @@ def _promote_supported_project_findings(db, mission_id: str) -> int:
     return len(rows)
 
 
-def _recover_stale_actions(db, mission_id: str) -> int:
+def _recover_stale_actions(db, mission_id: str | None = None) -> int:
     """Return orphaned controller work to the durable queue after a restart.
 
     A controller worker has a hard 30 minute timeout. A running row older than
     35 minutes therefore cannot still be healthy. Requeueing preserves its
     attempt count and lets the idempotent child mission recovery path finish it.
     """
+    mission_filter = "mission_id=? AND " if mission_id else ""
+    params = [mission_id, STALE_ACTION_MINUTES] if mission_id else [STALE_ACTION_MINUTES]
+    # One conditional UPDATE makes recovery race-safe: a worker that completes,
+    # retries, or refreshes its heartbeat while this statement waits is not
+    # overwritten and cannot be dispatched twice.
     rows = db.execute(
-        "SELECT id,branch_id FROM hive_research_actions WHERE mission_id=? "
-        "AND status='running' AND started_at < NOW()-(?||' minutes')::interval",
-        [mission_id, STALE_ACTION_MINUTES],
+        "UPDATE hive_research_actions SET status='retrying',next_attempt_at=NOW(),"
+        "error_message='Recovered orphaned running action after worker restart' "
+        f"WHERE {mission_filter}status='running' "
+        "AND COALESCE(heartbeat_at,started_at) < NOW()-(?||' minutes')::interval "
+        "RETURNING id,branch_id",
+        params,
     ).fetchall()
     for action_id, branch_id in rows:
-        db.execute(
-            "UPDATE hive_research_actions SET status='retrying',next_attempt_at=NOW(),"
-            "error_message='Recovered orphaned running action after worker restart' WHERE id=?",
-            [action_id],
-        )
         db.execute(
             "UPDATE hive_research_branches SET status='watching',reason='Controller worker restarted; resuming from durable child mission',"
             "updated_at=NOW() WHERE id=?", [branch_id],
         )
     return len(rows)
+
+
+@contextmanager
+def _action_heartbeat(action_id: int, interval_seconds: int = 30):
+    """Keep every controller action leased while any action type is executing."""
+    stopped = threading.Event()
+
+    def pulse() -> None:
+        while not stopped.wait(interval_seconds):
+            db = connect()
+            try:
+                db.execute(
+                    "UPDATE hive_research_actions SET heartbeat_at=NOW() "
+                    "WHERE id=? AND status='running'", [action_id]
+                )
+            except Exception as exc:
+                log.warning("Controller heartbeat failed for action %s: %s", action_id, exc)
+            finally:
+                db.close()
+
+    worker = threading.Thread(target=pulse, name=f"behive-action-heartbeat-{action_id}", daemon=True)
+    worker.start()
+    try:
+        yield
+    finally:
+        stopped.set()
+        worker.join(timeout=1)
+
+
+def recover_stale_actions() -> int:
+    """Recover orphaned actions globally before scheduler eligibility checks.
+
+    This must run before the scheduler's ``NOT EXISTS running`` predicate;
+    otherwise an orphan prevents its mission from ever reaching reconcile(),
+    where mission-scoped recovery historically occurred.
+    """
+    db = connect()
+    try:
+        return _recover_stale_actions(db)
+    finally:
+        db.close()
 
 
 def _record_change(db, mission_id: str, change_type: str, headline: str, detail: str,
@@ -698,23 +746,24 @@ def _run_next_action_locked(mission_id: str, trigger: str = "continuous") -> dic
     action_id, branch_id, action_type, rationale, attempt = row
     title_row = db.execute("SELECT title FROM hive_research_branches WHERE id=?", [branch_id]).fetchone()
     title = title_row[0] if title_row else action_type.replace("_", " ")
-    db.execute("UPDATE hive_research_actions SET status='running',attempt=attempt+1,started_at=NOW() WHERE id=?", [action_id])
+    db.execute("UPDATE hive_research_actions SET status='running',attempt=attempt+1,started_at=NOW(),heartbeat_at=NOW() WHERE id=?", [action_id])
     db.execute("UPDATE hive_research_branches SET status=?,last_action=?,last_checked_at=NOW(),updated_at=NOW() WHERE id=?",
                ["hypothesis_testing" if action_type == "evolve_hypotheses" else "verifying", action_type, branch_id])
     db.commit(); db.close()
     before = reconcile_result["after"]
     try:
-        if action_type == "research_question":
-            result = _research_question(mission_id, branch_id, action_id)
-        elif action_type == "refresh_evidence_map":
-            from behive.engine.frontier import run_frontier_cycle
-            result = run_frontier_cycle(mission_id, trigger=f"controller:{trigger}")
-        elif action_type == "evolve_hypotheses":
-            from behive.engine.evolution import evolve_hypotheses
-            result = evolve_hypotheses(mission_id, trigger=f"controller:{trigger}")
-        else:
-            from behive.engine.evolution import audit_graph
-            result = audit_graph(mission_id)
+        with _action_heartbeat(action_id):
+            if action_type == "research_question":
+                result = _research_question(mission_id, branch_id, action_id)
+            elif action_type == "refresh_evidence_map":
+                from behive.engine.frontier import run_frontier_cycle
+                result = run_frontier_cycle(mission_id, trigger=f"controller:{trigger}")
+            elif action_type == "evolve_hypotheses":
+                from behive.engine.evolution import evolve_hypotheses
+                result = evolve_hypotheses(mission_id, trigger=f"controller:{trigger}")
+            else:
+                from behive.engine.evolution import audit_graph
+                result = audit_graph(mission_id)
         db = connect(); after = _snapshot(db, mission_id)
         progress = sum(max(0, after[k]-before.get(k, 0)) for k in after)
         db.execute("UPDATE hive_research_actions SET status='complete',result=?::jsonb,completed_at=NOW() WHERE id=?",

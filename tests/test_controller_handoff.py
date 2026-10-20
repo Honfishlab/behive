@@ -189,7 +189,7 @@ def test_stale_running_action_is_requeued_after_worker_restart():
         def execute(self, sql, params=None):
             normalized = " ".join(sql.split())
             self.calls.append((normalized, params or []))
-            if normalized.startswith("SELECT id,branch_id FROM hive_research_actions"):
+            if normalized.startswith("UPDATE hive_research_actions SET status='retrying'"):
                 assert params == ["mission_1", controller.STALE_ACTION_MINUTES]
                 return Rows([(9, "branch_1")])
             return Result()
@@ -197,5 +197,83 @@ def test_stale_running_action_is_requeued_after_worker_restart():
     db = RecoveryDB()
     assert controller._recover_stale_actions(db, "mission_1") == 1
     updates = [sql for sql, _ in db.calls if sql.startswith("UPDATE")]
-    assert any("status='retrying'" in sql for sql in updates)
+    assert any("status='retrying'" in sql and "RETURNING id,branch_id" in sql for sql in updates)
     assert any("Controller worker restarted" in sql for sql in updates)
+
+
+def test_global_stale_recovery_runs_before_scheduler_eligibility():
+    class Rows(Result):
+        def fetchall(self):
+            return self.row
+
+    class RecoveryDB:
+        def __init__(self):
+            self.calls = []
+
+        def execute(self, sql, params=None):
+            normalized = " ".join(sql.split())
+            self.calls.append((normalized, params or []))
+            if normalized.startswith("UPDATE hive_research_actions SET status='retrying'"):
+                assert "mission_id=?" not in normalized
+                assert "status='running'" in normalized
+                assert "COALESCE(heartbeat_at,started_at) <" in normalized
+                assert params == [controller.STALE_ACTION_MINUTES]
+                return Rows([(51, "stale_branch")])
+            return Result()
+
+    db = RecoveryDB()
+    assert controller._recover_stale_actions(db) == 1
+    assert any("status='retrying'" in sql for sql, _ in db.calls)
+
+
+def test_global_stale_recovery_preserves_live_running_actions():
+    class EmptyRows(Result):
+        def fetchall(self):
+            return []
+
+    class LiveDB:
+        def __init__(self):
+            self.calls = []
+
+        def execute(self, sql, params=None):
+            normalized = " ".join(sql.split())
+            self.calls.append((normalized, params or []))
+            if normalized.startswith("UPDATE hive_research_actions SET status='retrying'"):
+                return EmptyRows()
+            raise AssertionError("A live action must not be updated")
+
+    db = LiveDB()
+    assert controller._recover_stale_actions(db) == 0
+    assert len(db.calls) == 1
+    assert "COALESCE(heartbeat_at,started_at) <" in db.calls[0][0]
+    assert "status='running'" in db.calls[0][0]
+
+
+def test_recovery_is_single_atomic_compare_and_set():
+    class Rows(Result):
+        def fetchall(self):
+            return self.row
+
+    class StateDB:
+        def __init__(self):
+            self.actions = {1: "complete", 2: "running"}
+            self.branches = []
+
+        def execute(self, sql, params=None):
+            normalized = " ".join(sql.split())
+            if normalized.startswith("UPDATE hive_research_actions SET status='retrying'"):
+                # Action 1 represents a concurrent completion before the atomic
+                # predicate executes; only the still-running stale row returns.
+                assert "WHERE status='running'" in normalized
+                assert "RETURNING id,branch_id" in normalized
+                self.actions[2] = "retrying"
+                return Rows([(2, "branch_2")])
+            if normalized.startswith("UPDATE hive_research_branches"):
+                self.branches.append(params[0])
+                return Result()
+            raise AssertionError(normalized)
+
+    db = StateDB()
+    assert controller._recover_stale_actions(db) == 1
+    assert db.actions == {1: "complete", 2: "retrying"}
+    assert db.branches == ["branch_2"]
