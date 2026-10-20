@@ -10,6 +10,39 @@ from behive.engine.llm import complete
 from behive.engine.research_intent import assess_relevance
 
 
+_EMPIRICAL_CUES = re.compile(
+    r"\b(found|showed|demonstrated|observed|reported|identified|associated|correlated|"
+    r"increased|decreased|reduced|elevated|expressed|expression|variant|mutation|"
+    r"patients?|participants?|cohort|trial|odds ratio|hazard ratio|confidence interval|"
+    r"significant|p\s*[<=>])\b", re.I,
+)
+
+
+def _deterministic_passages(topic: str, title: str, text: str, limit: int = 2) -> list[dict]:
+    """Select conservative verbatim observations when the extractor LLM is unavailable.
+
+    These are deliberately stored as low-confidence passage observations, not as
+    synthesized conclusions.  Every returned claim is the exact source sentence.
+    """
+    candidates = []
+    for raw in re.split(r"(?<=[.!?])\s+|[\r\n]+", text or ""):
+        sentence = re.sub(r"\s+", " ", raw).strip()
+        if not (45 <= len(sentence) <= 700) or not _EMPIRICAL_CUES.search(sentence):
+            continue
+        relevance = assess_relevance(topic, title or "", sentence)
+        if not relevance["accepted"] or relevance["score"] < .55:
+            continue
+        # References, navigation, and bare metadata often contain cue words but
+        # are not self-contained observations.
+        low = sentence.lower()
+        if low.startswith(("references", "copyright", "http", "table ", "figure ")):
+            continue
+        candidates.append({"claim": sentence, "exact_quote": sentence,
+                           "relevance": relevance, "confidence": .42})
+    candidates.sort(key=lambda item: item["relevance"]["score"], reverse=True)
+    return candidates[:limit]
+
+
 def _parse(value: str) -> list[dict]:
     try:
         data = json.loads(value)
@@ -60,12 +93,36 @@ a disease, intervention, population, or outcome absent from the quote. Return an
 is only topical or indirect. Maximum 8 claims.
 
 {source_text}"""
+            llm_failed = False
             try:
                 items = _parse(complete(prompt, stage="process", max_tokens=2200,
                                         temperature=0, json_mode=True))
             except Exception as exc:
                 record(mission_id, "extract", "batch", "failed", reason=str(exc),
                        details={"offset": offset}, db=db)
+                items = []
+                llm_failed = True
+            if llm_failed:
+                # Preserve potentially useful excerpts during provider outages
+                # without promoting them to findings. They remain explicitly
+                # unreviewed and have no claim_id until entailment is checked.
+                for source_index, doc in enumerate(batch, start=1):
+                    for item in _deterministic_passages(topic, doc[1] or "", doc[2] or ""):
+                        db.execute(
+                            "INSERT INTO hive_evidence_passages "
+                            "(mission_id,source_url,claim_id,passage,locator,evidence_type,direct_support,"
+                            "relevance_score,metadata) VALUES (?,?,NULL,?,?,'unreviewed_empirical_excerpt',"
+                            "FALSE,?,?::jsonb)",
+                            [mission_id, doc[0], item["exact_quote"], "verbatim source sentence",
+                             item["relevance"]["score"], json.dumps({
+                                 "review_status": "unreviewed",
+                                 "reason": "LLM entailment check unavailable",
+                                 "source_index": source_index,
+                             })],
+                        )
+                        record(mission_id, "extract", "passage", "captured_unreviewed",
+                               reason="verbatim empirical excerpt awaiting entailment review",
+                               details=item["relevance"], db=db)
                 continue
             for item in items:
                 if not isinstance(item, dict) or item.get("direct_support") is not True:
