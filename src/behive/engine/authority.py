@@ -9,7 +9,9 @@ import os
 import re
 import urllib.parse
 import urllib.request
+import urllib.error
 import xml.etree.ElementTree as ET
+import time
 
 from behive.engine.db import connect
 from behive.engine.research_intent import assess_relevance, build_query_families
@@ -18,9 +20,27 @@ log = logging.getLogger(__name__)
 AGENT = "BeHive-Research-OS/1.0 (verified scholarly discovery)"
 
 
+def _open_with_rate_limit_retry(request, timeout: int):
+    """Respect registry throttling with bounded Retry-After/backoff retries."""
+    for attempt in range(3):
+        try:
+            return urllib.request.urlopen(request, timeout=timeout)
+        except urllib.error.HTTPError as exc:
+            if exc.code != 429 or attempt == 2:
+                raise
+            retry_after = exc.headers.get("Retry-After") if exc.headers else None
+            try:
+                delay = float(retry_after)
+            except (TypeError, ValueError):
+                delay = 2 ** attempt
+            delay = max(.5, min(delay, 8.0))
+            log.info("Registry rate limited; respecting Retry-After for %.1fs", delay)
+            time.sleep(delay)
+
+
 def _get(url: str, accept: str = "application/json", timeout: int = 20) -> str:
     request = urllib.request.Request(url, headers={"User-Agent": AGENT, "Accept": accept})
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    with _open_with_rate_limit_retry(request, timeout) as response:
         return response.read().decode("utf-8", errors="replace")
 
 
@@ -29,7 +49,7 @@ def _post_json(url: str, payload: dict, timeout: int = 25) -> dict:
         url, data=json.dumps(payload).encode("utf-8"), method="POST",
         headers={"User-Agent": AGENT, "Accept": "application/json", "Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    with _open_with_rate_limit_retry(request, timeout) as response:
         return json.loads(response.read().decode("utf-8", errors="replace"))
 
 

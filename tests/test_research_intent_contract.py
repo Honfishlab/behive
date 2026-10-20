@@ -2,6 +2,7 @@
 from behive.engine.research_intent import (
     assess_corpus_adequacy,
     assess_relevance,
+    build_competing_hypotheses,
     build_intent,
     build_query_families,
 )
@@ -89,3 +90,48 @@ def test_joint_gold_nad_corpus_is_adequate():
     result = assess_corpus_adequacy(topic, records)
     assert result["adequate"]
     assert result["joint_entity_records"] == 3
+
+
+IGFBP7_PORTFOLIO = (
+    "Build a broad evidence map of IGFBP7 and HMB across human ALS genetics, "
+    "biomarkers, mechanisms, published studies and registered trials, with separate direct evidence."
+)
+
+
+def test_portfolio_intent_admits_separate_entity_branches():
+    intent = build_intent(IGFBP7_PORTFOLIO)
+    assert intent.mode == "portfolio"
+    assert {item["canonical"] for item in intent.primary_entities} >= {"igfbp7", "hmb"}
+    assert assess_relevance(
+        IGFBP7_PORTFOLIO,
+        "IGFBP7 expression in amyotrophic lateral sclerosis spinal cord",
+        "Human motor-neuron tissue showed disease-associated IGFBP7 expression.",
+    )["accepted"]
+    assert assess_relevance(
+        IGFBP7_PORTFOLIO,
+        "Beta-hydroxy-beta-methylbutyrate supplementation in muscle",
+        "A controlled human HMB intervention measured IGF-1 pathway outcomes.",
+    )["accepted"]
+    assert not assess_relevance(
+        IGFBP7_PORTFOLIO, "AI predicts heart failure", "A generic machine-learning study."
+    )["accepted"]
+
+
+def test_portfolio_corpus_requires_branch_coverage_not_joint_mentions():
+    records = [
+        {"title": "IGFBP7 genetics in ALS", "abstract": "A human ALS reversal variant study."},
+        {"title": "IGFBP7 in motor-neuron tissue", "abstract": "Expression in ALS spinal cord."},
+        {"title": "HMB supplementation", "abstract": "A controlled human HMB study measured IGF-1."},
+    ]
+    result = assess_corpus_adequacy(IGFBP7_PORTFOLIO, records)
+    assert result["adequate"]
+    assert result["joint_entity_records"] == 0
+    assert not result["missing_entities"]
+
+
+def test_igfbp7_portfolio_queries_and_hypotheses_are_specific():
+    purposes = {item["purpose"] for item in build_query_families(IGFBP7_PORTFOLIO)}
+    assert {"direct ALS", "reversal genetics", "HMB intervention", "trial verification"} <= purposes
+    hypotheses = build_competing_hypotheses(IGFBP7_PORTFOLIO)
+    assert len(hypotheses) == 3
+    assert all(item["hypothesis"] and item["competes_with"] and item["falsified_by"] for item in hypotheses)

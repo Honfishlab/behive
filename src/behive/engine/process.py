@@ -578,9 +578,25 @@ class RelevanceFilter:
         KEYWORD_AUTO_PASS = 0.25  # Keyword match = auto-pass (SGLang LLM too aggressive)
         auto_passed = []
         for doc in remaining:
+            # The source-admission layer already has an explainable canonical
+            # intent model.  Reuse it here so a broad portfolio paper is judged
+            # against its own branch (for example HMB), not against every word
+            # in a long multi-branch mission prompt.
+            try:
+                from behive.engine.research_intent import assess_relevance
+                intent_relevance = assess_relevance(
+                    self.topic, doc.get("title", ""),
+                    doc.get("content") or doc.get("text") or doc.get("raw_text") or "",
+                )
+            except Exception:
+                intent_relevance = {"accepted": False, "score": 0.0}
             kw_score = self._keyword_overlap(doc)
             doc["_keyword_score"] = kw_score
-            if kw_score >= KEYWORD_AUTO_PASS:
+            if intent_relevance["accepted"] and intent_relevance["score"] >= 0.55:
+                doc["_relevance_score"] = max(.55, float(intent_relevance["score"]))
+                doc["_intent_relevance"] = intent_relevance
+                auto_passed.append(doc)
+            elif kw_score >= KEYWORD_AUTO_PASS:
                 # Strong keyword overlap — bypass LLM scoring (first-party data, press releases)
                 doc["_relevance_score"] = kw_score
                 auto_passed.append(doc)

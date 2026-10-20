@@ -1,6 +1,19 @@
+import io
+import urllib.error
 from unittest.mock import patch
 
 from behive.engine import authority
+
+
+class Response:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def read(self):
+        return b'{"ok": true}'
 
 
 class Result:
@@ -84,3 +97,16 @@ def test_targeted_probe_is_not_expanded_again():
     pubmed.assert_called_once_with("mission", query, db, 8)
     assert len(result["registries"]) == 2
     assert all(item["purpose"] == "targeted_probe" for item in result["registries"])
+
+
+def test_http_429_is_retried_with_retry_after():
+    error = urllib.error.HTTPError(
+        "https://example.test", 429, "rate limited", {"Retry-After": "1"}, io.BytesIO()
+    )
+    with patch("urllib.request.urlopen", side_effect=[error, Response()]) as urlopen, \
+         patch.object(authority.time, "sleep") as sleep:
+        result = authority._get("https://example.test")
+
+    assert result == '{"ok": true}'
+    assert urlopen.call_count == 2
+    sleep.assert_called_once_with(1.0)

@@ -1244,6 +1244,11 @@ def _record_insufficient_evidence(mission_id: str, document_count: int,
             "SELECT gap_query,priority FROM hive_gaps WHERE mission_id=? AND resolved=FALSE ORDER BY priority DESC LIMIT 10",
             [mission_id],
         ).fetchall()
+        project_questions = con.execute(
+            "SELECT q.question,q.priority FROM hive_questions q JOIN hive_missions m ON m.project_id=q.project_id "
+            "WHERE m.id=? AND q.parent_id IS NOT NULL AND q.status<>'archived' "
+            "ORDER BY q.priority DESC LIMIT 10", [mission_id]
+        ).fetchall()
         cited = con.execute(
             "SELECT COUNT(DISTINCT url) FROM hive_content WHERE mission_id=? AND COALESCE(harvest_method,'')<>'snippet_fallback' AND word_count>=300",
             [mission_id],
@@ -1262,6 +1267,13 @@ def _record_insufficient_evidence(mission_id: str, document_count: int,
         f"The system found {document_count} candidate records but could not extract any defensible, "
         "source-linked findings for this question. No substantive conclusion should be drawn yet."
     )
+    useful_gaps = [(q, p) for q, p in gaps
+                   if "insufficient data" not in (q or "").lower()
+                   and not (q or "").lower().startswith("research gap")]
+    if not useful_gaps:
+        useful_gaps = project_questions
+    from behive.engine.research_intent import build_competing_hypotheses
+    hypotheses = build_competing_hypotheses(topic)
     analysis = {
         "depth_status": depth_status,
         "executive_assessment": assessment,
@@ -1271,8 +1283,9 @@ def _record_insufficient_evidence(mission_id: str, document_count: int,
             f"Available material by retrieval method: {method_summary}.",
             "Search-result summaries are discovery records, not evidence, and were not converted into medical claims.",
         ],
-        "research_gaps": [{"question": q, "priority": p, "why": "Required to obtain full-text, primary or peer-reviewed evidence."}
-                          for q, p in gaps],
+        "research_gaps": [{"question": q, "priority": p, "why": "A scoped evidence branch requiring full-text, primary or peer-reviewed evidence."}
+                          for q, p in useful_gaps],
+        "candidate_hypotheses": hypotheses,
         "retrieval_adequacy": adequacy,
         "evidence_metrics": {"claims": 0, "cited_sources": 0, "documents_reviewed": document_count,
                              "full_text_sources": cited, "generated_at": datetime.utcnow().isoformat()},
@@ -1281,7 +1294,11 @@ def _record_insufficient_evidence(mission_id: str, document_count: int,
               f"{analysis['executive_assessment']}\n\n## Why research stopped\n\n" +
               "\n".join(f"- {item}" for item in analysis["limitations"]) +
               "\n\n## Recommended next questions\n\n" +
-              ("\n".join(f"- {item['question']}" for item in analysis["research_gaps"]) or "- Acquire relevant primary evidence."))
+              ("\n".join(f"- {item['question']}" for item in analysis["research_gaps"]) or "- Acquire relevant primary evidence.") +
+              ("\n\n## Competing hypotheses to test\n\n" + "\n".join(
+                  f"- **Candidate:** {item['hypothesis']} **Alternative:** {item['competes_with']} "
+                  f"**Would be weakened or falsified by:** {item['falsified_by']}" for item in hypotheses
+              ) if hypotheses else ""))
     write_con = _connect_db()
     try:
         write_con.execute(ANALYSIS_SCHEMA)

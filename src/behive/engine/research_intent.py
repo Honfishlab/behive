@@ -10,6 +10,9 @@ from dataclasses import asdict, dataclass, field
 
 
 _ALIASES = {
+    "igfbp7": ["igfbp7", "igfbp-7", "insulin-like growth factor binding protein 7", "angiomodulin"],
+    "hmb": ["hmb", "beta-hydroxy-beta-methylbutyrate", "beta hydroxy beta methylbutyrate"],
+    "igf-1": ["igf-1", "igf1", "insulin-like growth factor 1", "insulin like growth factor i"],
     "nad": ["nad", "nad+", "nadh", "nad(h)", "nicotinamide adenine dinucleotide"],
     "gold nanoparticle": ["gold nanoparticle", "gold nanoparticles", "gold particle", "gold particles", "gold nanomaterial",
                           "gold nanomaterials", "aunp", "au nps", "colloidal gold", "nanogold"],
@@ -30,6 +33,10 @@ _CONTEXT_ALIASES = {
     "cns": ["brain", "central nervous system", "cns", "blood brain barrier", "bbb"],
     "catalysis": ["cataly", "nanozyme", "oxidation", "redox", "electron transfer"],
     "particle_size": ["5 nm", "5nm", "nanometer", "particle size"],
+    "reversal": ["reversal", "recovery", "reverser"],
+    "genetics": ["genetic", "genomic", "eqtl", "variant", "rs4242007", "igfbp7-as1"],
+    "biomarker": ["biomarker", "serum", "plasma", "blood", "csf", "expression", "transcript"],
+    "trial": ["clinical trial", "registered trial", "clinicaltrials.gov", "nct07589764"],
 }
 _GENERIC = {
     "implication", "implications", "function", "functions", "body", "substance",
@@ -61,6 +68,7 @@ def _context_contains(text: str, alias: str) -> bool:
 @dataclass
 class ResearchIntent:
     topic: str
+    mode: str = "intersection"
     primary_entities: list[dict] = field(default_factory=list)
     contexts: list[dict] = field(default_factory=list)
     excluded_senses: list[str] = field(default_factory=list)
@@ -71,6 +79,9 @@ class ResearchIntent:
 
 def build_intent(topic: str) -> ResearchIntent:
     normalized = _norm(topic)
+    portfolio_markers = ("broad evidence", "evidence map", "across human", "published and registered",
+                         "separate direct", "research questions")
+    mode = "portfolio" if any(marker in normalized for marker in portfolio_markers) else "intersection"
     entities = []
     for canonical, aliases in _ALIASES.items():
         if any(_contains(normalized, alias) for alias in aliases):
@@ -78,8 +89,15 @@ def build_intent(topic: str) -> ResearchIntent:
     if not entities:
         # Acronyms are often the most information-bearing biomedical subjects.
         acronyms = re.findall(r"(?<![A-Za-z0-9])([A-Z][A-Z0-9-]{1,8}\+?)(?![A-Za-z0-9])", topic or "")
-        for value in acronyms[:2]:
-            entities.append({"canonical": value.lower(), "aliases": [value.lower()]})
+        seen_acronyms = set()
+        for value in acronyms:
+            canonical = value.lower()
+            if canonical in seen_acronyms:
+                continue
+            seen_acronyms.add(canonical)
+            entities.append({"canonical": canonical, "aliases": [canonical]})
+            if len(entities) >= 3:
+                break
     if not entities:
         tokens = [t for t in re.findall(r"[a-z0-9-]{4,}", normalized) if t not in _GENERIC]
         if tokens:
@@ -92,7 +110,7 @@ def build_intent(topic: str) -> ResearchIntent:
     excluded = []
     if any(e["canonical"] == "nad" for e in entities):
         excluded += ["sodium D spectral line", "NaD stellar absorption", "astronomical spectroscopy"]
-    return ResearchIntent(topic=topic, primary_entities=entities, contexts=contexts, excluded_senses=excluded)
+    return ResearchIntent(topic=topic, mode=mode, primary_entities=entities, contexts=contexts, excluded_senses=excluded)
 
 
 def assess_relevance(topic: str, title: str, abstract: str = "") -> dict:
@@ -110,8 +128,9 @@ def assess_relevance(topic: str, title: str, abstract: str = "") -> dict:
         if re.search(r"\b(stellar|galaxy|galaxies|spectral|spectroscopy|mass function)\b", low):
             excluded.append("astronomical NaD")
     entity_ratio = len(entity_hits) / max(1, len(intent.primary_entities))
+    scoring_entity_ratio = 1.0 if intent.mode == "portfolio" and entity_hits else entity_ratio
     context_ratio = len(context_hits) / max(1, len(intent.contexts)) if intent.contexts else 1.0
-    score = max(0.0, min(1.0, .7 * entity_ratio + .3 * context_ratio - (.8 if excluded else 0)))
+    score = max(0.0, min(1.0, .7 * scoring_entity_ratio + .3 * context_ratio - (.8 if excluded else 0)))
     # When the mission names contexts (disease, mechanism, outcome), entity-only
     # mentions are discovery noise, not admissible evidence.
     specific_context = bool({"als", "neurodegeneration"}.intersection(context_hits))
@@ -121,8 +140,11 @@ def assess_relevance(topic: str, title: str, abstract: str = "") -> dict:
     # or only gold nanoparticles, may inspire a child path but cannot support
     # the parent mechanism and must not enter its evidence corpus.
     complete_entity_match = bool(entity_hits) and (
-        len(intent.primary_entities) == 1 or len(entity_hits) == len(intent.primary_entities)
+        intent.mode == "portfolio" or len(intent.primary_entities) == 1
+        or len(entity_hits) == len(intent.primary_entities)
     )
+    if intent.mode == "portfolio" and title_entity_hits:
+        contextual_support = True
     accepted = complete_entity_match and not excluded and contextual_support
     return {"accepted": accepted, "score": round(score, 4), "entity_hits": entity_hits,
             "title_entity_hits": title_entity_hits, "context_hits": context_hits,
@@ -145,18 +167,21 @@ def assess_corpus_adequacy(topic: str, records: list[dict]) -> dict:
     covered = sorted({hit for item in relevant for hit in item["entity_hits"]})
     required = [item["canonical"] for item in intent.primary_entities]
     enough_relevant = len(relevant) >= min(3, max(1, len(records)))
-    enough_joint = len(required) < 2 or len(joint) >= 1
-    adequate = bool(records) and enough_relevant and enough_joint
+    enough_joint = intent.mode == "portfolio" or len(required) < 2 or len(joint) >= 1
+    enough_coverage = not required or all(value in covered for value in required)
+    adequate = bool(records) and enough_relevant and enough_joint and enough_coverage
     return {
         "adequate": adequate,
         "records": len(records),
         "relevant_records": len(relevant),
         "joint_entity_records": len(joint),
         "required_entities": required,
+        "intent_mode": intent.mode,
         "covered_entities": covered,
         "missing_entities": [value for value in required if value not in covered],
         "reason": ("adequate" if adequate else
                    "no records retrieved" if not records else
+                   "portfolio branches are missing from retrieval" if intent.mode == "portfolio" and not enough_coverage else
                    "compound topic was split during retrieval" if len(required) >= 2 and not joint else
                    "too few topically relevant records"),
     }
@@ -174,6 +199,22 @@ def build_query_families(topic: str) -> list[dict]:
         return f'"{entity["aliases"][0]}"'
 
     subjects = [subject_for(entity) for entity in intent.primary_entities]
+    if intent.mode == "portfolio":
+        canonicals = {entity["canonical"] for entity in intent.primary_entities}
+        if {"igfbp7", "hmb"}.issubset(canonicals):
+            return [
+                {"purpose": "direct ALS", "query": 'IGFBP7 amyotrophic lateral sclerosis ALS'},
+                {"purpose": "reversal genetics", "query": 'IGFBP7 rs4242007 ALS reversal genetics eQTL IGFBP7-AS1'},
+                {"purpose": "tissue expression", "query": 'IGFBP7 ALS spinal cord motor neuron iPSC serum CSF expression'},
+                {"purpose": "mechanism", "query": 'IGFBP7 IGF-1 signaling motor neuron mechanism'},
+                {"purpose": "HMB intervention", "query": 'HMB beta-hydroxy-beta-methylbutyrate IGFBP7'},
+                {"purpose": "HMB adjacent evidence", "query": 'HMB IGF-1 muscle neurological ALS'},
+                {"purpose": "trial verification", "query": 'NCT07589764 IGFBP7 HMB ALS clinical trial'},
+                {"purpose": "datasets", "query": 'IGFBP7 IGFBP7-AS1 ALS transcriptomics single cell GEO'},
+            ]
+        families = [{"purpose": entity["canonical"], "query": f"{subject_for(entity)} review evidence"}
+                    for entity in intent.primary_entities]
+        return families[:8]
     subject = " ".join(subjects)
     contexts = [c["canonical"] for c in intent.contexts]
     families = [{"purpose": "overview", "query": f"{subject} review mechanism"}]
@@ -196,3 +237,27 @@ def build_query_families(topic: str) -> list[dict]:
         if key not in seen:
             seen.add(key); result.append(family)
     return result[:8]
+
+
+def build_competing_hypotheses(topic: str) -> list[dict]:
+    """Return clearly labeled test targets, never asserted conclusions."""
+    entities = {item["canonical"] for item in build_intent(topic).primary_entities}
+    if not {"igfbp7", "hmb"}.issubset(entities):
+        return []
+    return [
+        {
+            "hypothesis": "IGFBP7 is a causal modifier of an ALS-reversal phenotype.",
+            "competes_with": "The association reflects linkage, selection, diagnostic heterogeneity, or chance.",
+            "falsified_by": "Well-powered replication and functional perturbation show no genotype-expression-phenotype chain.",
+        },
+        {
+            "hypothesis": "ALS-associated IGFBP7 measurements reflect motor-neuron or CNS disease biology.",
+            "competes_with": "Circulating IGFBP7 reflects peripheral tissue injury, vascular biology, age, or systemic inflammation.",
+            "falsified_by": "Paired blood/CSF/tissue studies show no compartment concordance or ALS-specific signal.",
+        },
+        {
+            "hypothesis": "HMB changes an IGFBP7-linked pathway relevant to ALS.",
+            "competes_with": "Any HMB-associated IGFBP7 change is exercise/muscle-specific and does not translate to CNS biology.",
+            "falsified_by": "Controlled studies show no target change, no dose-response, or no CNS/motor-neuron pathway engagement.",
+        },
+    ]
